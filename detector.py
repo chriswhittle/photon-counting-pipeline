@@ -54,6 +54,7 @@ def no_photon_prob(f, strain, budget, templates):
     # TODO: this assumes transfer function is flat, i.e. (32)
     # neglects any recycling in IFO.
     Parm = gwinc.ifo.noises.ifo_power(budget.ifo).parm
+    Larm = budget.ifo.Infrastructure.Length
     wavelength = budget.ifo.Laser.Wavelength
     wavenumber = 2 * np.pi / wavelength
     omega = SPEED_OF_LIGHT * wavenumber
@@ -63,7 +64,7 @@ def no_photon_prob(f, strain, budget, templates):
     g = 2 * wavenumber * np.sqrt(Parm / (2*REDUCED_PLANCK*omega))
 
     # output fields
-    output_fields = g * strain
+    output_fields = g * (strain * Larm)
 
     # mean fields in output templates
     # units of sqrt(quanta) TODO: check this

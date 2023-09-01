@@ -30,7 +30,7 @@ def inner_product(f, a, b):
     bw = f[1] - f[0]
     return bw * np.sum(a * np.conj(b), axis=0) / (2*np.pi)
 
-def waveform(f, A, f0, bw, phi):
+def waveform(f, A, f0, bw, phi, lim_factor=30):
     """
     Compute and return a Lorentzian wavelet with the following parameters,
     each stored in numpy arrays of equal length (aside from f):
@@ -46,7 +46,12 @@ def waveform(f, A, f0, bw, phi):
         f = f[:, np.newaxis].repeat(A.shape[0], axis=1)
 
     # Lorentzian wavelet # TODO: update waveform
-    wavelet =  np.exp(1j * phi) / (1 + ((f - f0) / (bw/2))**2)
+    wavelet = np.exp(1j * phi) / (1 + ((f - f0) / (bw/2))**2)
+
+    #TODO: add time delay parameter; ~ exp(-2j*pi*f*t0)
+
+    # hard cutoff outside several bandwidths
+    wavelet *= (np.abs(f - f0) < lim_factor * bw)
 
     # time delay to center wavelet at t=0
     bw = f[1] - f[0]
