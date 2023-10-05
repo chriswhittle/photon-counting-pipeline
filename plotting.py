@@ -18,7 +18,6 @@ plt.rcParams.update({
 
 @dataclass
 class Plotter:
-    config: pipeline.DetectionPipeline
     results: pipeline.PipelineResults
 
     def plot_astro_chains(self, ind=-1):
@@ -36,7 +35,7 @@ class Plotter:
 
         # fetch the true astrophysical parameters
         true_params = np.concatenate(
-            (self.config.param_means, self.config.param_stds)
+            (self.results.config.param_means, self.results.config.param_stds)
         )
 
         # iterate over each parameter and plot the chains as a function of
@@ -71,7 +70,7 @@ class Plotter:
 
         # fetch the true astrophysical parameters
         true_params = np.concatenate(
-            (self.config.param_means, self.config.param_stds)
+            (self.results.config.param_means, self.results.config.param_stds)
         )
 
         # plot the evolution of the inferred parameters (including means and

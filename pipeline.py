@@ -5,8 +5,10 @@ from inspect import signature
 import numpy as np
 from scipy.constants import c, hbar
 from scipy.special import comb
+from scipy.linalg import orth
 import gwinc
 import emcee
+from multiprocessing import Pool
 from tqdm import tqdm
 
 import waveform
@@ -26,20 +28,6 @@ def frequency_bins(sampling_frequency, bin_width, f_low=None, f_high=None):
 
     return f
 
-@dataclass
-class PipelineResults:
-    """
-    Class for storing results from a pipeline run.
-    """
-    event_samples: List[emcee.EnsembleSampler]
-    event_flat_samples: List[np.ndarray]
-    event_means: np.ndarray
-    event_stds: np.ndarray
-    astro_samples: List[emcee.EnsembleSampler]
-    astro_flat_samples: List[np.ndarray]
-    pc_astro_samples: List[emcee.EnsembleSampler]
-    pc_astro_flat_samples: List[np.ndarray]
-
 class DetectionPipeline:
 
     ##############################################################
@@ -50,7 +38,7 @@ class DetectionPipeline:
                  detector='CE1', waveform_func=waveform.lorentzian,
                  snr_cutoff=0.8, param_means=None, param_stds=None,
                  mcmc_mask=None, priors=None, dist_priors=None,
-                 template_params=None):
+                 template_params=None, parallel=True):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -79,6 +67,7 @@ class DetectionPipeline:
                 [(mean_lower, mean_upper), ..., (std_lower, std_upper), ...]
             template_params: list of parameters for each template waveform for
                 photon counting detection
+            parallel: whether to use Multiprocessing parallelization
         """
         # generate frequency bins
         self.bw = bin_width
@@ -119,23 +108,28 @@ class DetectionPipeline:
         self.param_means = np.array(param_means, dtype=np.float64)
         self.param_stds = np.array(param_stds, dtype=np.float64)
         self.mcmc_mask = mcmc_mask
+        self.ndim_p = np.sum(mcmc_mask)
+        self.parallel = parallel
 
         # priors for parameters of individual event
         self.priors = priors
         assert(self.priors is not None)
+
         # priors for parameters of astrophysical distribution
         self.dist_priors = dist_priors
         assert(self.dist_priors is not None)
 
         # parameters with non-zero standard deviation need to be included in
-        # MCMC
+        # MCMC; parameters not inferred should have zero variance
         for i, std in enumerate(self.param_stds):
-            if std > 0:
-                assert(self.mcmc_mask[i])
+            assert(self.mcmc_mask[i] == (std > 0))
 
         # compute template waveforms given matrix of parameter values
         if template_params is not None:
             self.templates = self.waveform(np.array(template_params).T)
+
+            # orthonormalize waveform templates
+            self.templates = orth(self.templates)
 
     ##############################################################
     ###################### WAVEFORM METHODS ######################
@@ -336,12 +330,95 @@ class DetectionPipeline:
     DEFAULT_WALKERS = 100
     DEFAULT_STEPS = 5000
 
+    DEFAULT_WALKERS = 50 #TODO:
+    DEFAULT_STEPS = 300 #TODO:
+
     # daefault discard and thin values walker chains
     # discard should be ~ a few times the autocorrelation time
     # thin should be ~ 1/2 the autocorrelation time
     # https://emcee.readthedocs.io/en/stable/tutorials/line/
     N_DISCARD = 50
     N_THIN = 10
+    #TODO: look at autocorrelation and change
+
+    # constants for setting up walker initial positions
+    EPS = 1e-3
+    WALKER_STD = 3e-1
+
+
+    ### prior, likelihood, probability functions
+    # these need to be top-level to be pickle-able by Multiprocessing
+
+    def log_prior(self, theta, priors):
+        """
+        Compute the log-prior for the given parameters.
+            theta: array of parameters
+            priors: list of tuples of (lower, upper) bounds for each parameter
+        """
+        if all([p[0] <= x <= p[1] for p, x in zip(priors, theta)]):
+            return 0.0
+        return -np.inf
+    
+    def log_prior_event(self, theta):
+        """
+        Compute the log-prior for the given parameters of a single event.
+            theta: array of parameters
+        """
+        return self.log_prior(theta, self.priors)
+    
+    def log_prior_dist(self, theta):
+        """
+        Compute the log-prior for the given parameters of the astrophysical
+        distribution.
+            theta: array of parameters
+        """
+        return self.log_prior(theta, self.dist_priors)
+
+    def log_likelihood_pc(self, theta, counts, nint=100):
+        """
+        Likelihood function for photon counting.
+            theta: array of parameters
+            counts: array of photon counts
+        """
+        # separate inferred parameters into means and stds
+        means = theta[:self.ndim_p]
+        stds = theta[self.ndim_p:]
+
+        # for this astrophysical distribution, compute the probabilities
+        # of observing zero photons in each template mode by sampling
+        # waveforms from this distribution and computing the average
+        # probability
+        int_wv = (self.sample_events(nint, means=means, stds=stds) + 
+                    self.simulate_noise(nint, self.noise_classical))
+        int_probs = self.no_photon_prob(int_wv)
+        avg_probs = np.mean(int_probs, axis=0)
+
+        # number of events seen so far
+        num_events = counts.shape[0]
+
+        # compute log likelihood for binomial distribution
+        return np.sum(
+            # np.log(comb(num_events, counts)) +
+            (num_events - counts) * np.log(avg_probs) +
+            counts * np.log(1 - avg_probs)
+        )
+
+    def log_probability(self, theta, prior_fn, likelihood_fn, *args):
+        """
+        Compute the overall log-probability = log-prior + log-likelihood for the
+        given parameters, likelihood function (and additional arguments).
+
+            theta: array of parameters
+            prior_fn: function for computing prior
+            likelihood_fn: function for computing likelihood
+            args: additional arguments for likelihood function
+        """
+        lp = prior_fn(theta)
+        if not np.isfinite(lp):
+            return -np.inf
+        return lp + likelihood_fn(theta, *args)
+
+    ### MCMC functions
 
     def strain_mc(self, strains, p0, nwalkers=None, nsteps=None,
                   show_progress=True):
@@ -408,7 +485,9 @@ class DetectionPipeline:
             wv = strains[:, wv_ind]
 
             # use actual parameters as initial guesses with some noise
-            pos = (p0[:, wv_ind]) * (1 + np.random.randn(nwalkers, ndim)/4)
+            pos = (p0[:, wv_ind] * 
+                   (1 + np.random.randn(nwalkers, ndim)*self.WALKER_STD)
+                )
 
             # construct sampler and run MCMC
             sampler = emcee.EnsembleSampler(
@@ -442,12 +521,9 @@ class DetectionPipeline:
         if nsteps is None:
             nsteps = self.DEFAULT_STEPS
 
-        # number of event parameters being inferred
-        ndim_p = np.sum(self.mcmc_mask)
-
         # number of parameters to infer: two (mean and std) for each
         # intrinsic parameter; parameters in order of [means | stds]
-        ndim = 2*ndim_p
+        ndim = 2*self.ndim_p
 
         # uniform priors
         def log_prior(theta):
@@ -458,8 +534,8 @@ class DetectionPipeline:
         # log likelihood assuming event-wise posteriors are Gaussian
         def log_likelihood(theta, param_means, param_stds):
             # separate inferred parameters into means and stds
-            means = theta[:ndim_p]
-            stds = theta[ndim_p:]
+            means = theta[:self.ndim_p]
+            stds = theta[self.ndim_p:]
 
             # pre-compute sum of astrophysical stds and inferred event-wise stds
             std_sum2 = stds**2 + param_stds**2
@@ -481,7 +557,9 @@ class DetectionPipeline:
         pos = np.concatenate(
             (self.param_means[self.mcmc_mask], self.param_stds[self.mcmc_mask])
         )
-        pos = pos * (1 + np.random.randn(nwalkers, ndim)/4) + np.random.randn(nwalkers, ndim)/4
+        # some extra scatter on walker initial positions
+        pos = (pos * (1 + np.random.randn(nwalkers, ndim)*self.WALKER_STD) 
+               + np.random.randn(nwalkers, ndim)*self.WALKER_STD)
 
         # save MCMC results in a list
         samplers = [None] * param_means.shape[0]
@@ -504,7 +582,31 @@ class DetectionPipeline:
 
         return samplers
 
-    def count_mc(self, counts, nwalkers=None, nsteps=None, nint=2,
+    def _count_mc_seq(self, args):
+        """
+        Helper function for parallelizing photon count MCMC by performing MCMC 
+        on a subsequence of events. Needs to be top-level to be pickle-able.
+
+            args: tuple of arguments
+        """
+        # unpack arguments
+        counts, pos, nwalkers, ndim, nint, nsteps = args
+
+        # initialize sampler
+        sampler = emcee.EnsembleSampler(
+            nwalkers, ndim, self.log_probability,
+            args=(
+                self.log_prior_dist, self.log_likelihood_pc, 
+                counts, nint,
+                )
+        )
+
+        # run MCMC
+        sampler.run_mcmc(pos, nsteps)
+
+        return sampler
+
+    def count_mc(self, counts, nwalkers=None, nsteps=None, nint=10,
                  show_progress=True):
         """
         Perform MCMC to infer the parameters of the given waveforms, after they have
@@ -520,76 +622,45 @@ class DetectionPipeline:
         if nsteps is None:
             nsteps = self.DEFAULT_STEPS
 
-        # number of event parameters being inferred
-        ndim_p = np.sum(self.mcmc_mask)
-
         # number of parameters to infer: two (mean and std) for each
         # intrinsic parameter; parameters in order of [means | stds]
-        ndim = 2*ndim_p
-
-        # uniform priors
-        def log_prior(theta):
-            if all([p[0] < x < p[1] for p, x in zip(self.dist_priors, theta)]):
-                return 0.0
-            return -np.inf
-
-        # log likelihood assuming event-wise posteriors are Gaussian
-        def log_likelihood(theta, counts):
-            # separate inferred parameters into means and stds
-            means = theta[:ndim_p]
-            stds = theta[ndim_p:]
-
-            # for this astrophysical distribution, compute the probabilities
-            # of observing zero photons in each template mode by sampling
-            # waveforms from this distribution and computing the average
-            # probability
-            int_wv = (self.sample_events(nint, means=means, stds=stds) + 
-                      self.simulate_noise(nint, self.noise_classical))
-            int_probs = self.no_photon_prob(int_wv)
-            avg_probs = np.mean(int_probs, axis=0)
-
-            # number of events seen so far
-            num_events = counts.shape[0]
-
-            # compute log likelihood for binomial distribution
-            return np.sum(
-                # np.log(comb(num_events, counts)) +
-                (num_events - counts) * np.log(avg_probs) +
-                counts * np.log(1 - avg_probs)
-            )
-        
-        # probability = prior * likelihood
-        def log_probability(theta, counts):
-            lp = log_prior(theta)
-            if not np.isfinite(lp):
-                return -np.inf
-            return lp + log_likelihood(theta, counts)
+        ndim = 2*self.ndim_p
 
         # use actual astrophysical means and standard deviations as initial
         # positions for walkers
         pos = np.concatenate(
             (self.param_means[self.mcmc_mask], self.param_stds[self.mcmc_mask])
         )
-        pos = pos * (1 + np.random.randn(nwalkers, ndim)/4) + np.random.randn(nwalkers, ndim)/4
-
-        # save MCMC results in a list
-        samplers = [None] * counts.shape[0]
+        pos = pos * (1 + np.random.randn(nwalkers, ndim)/10) + np.random.randn(nwalkers, ndim)/10
+        # force initial positions to be within the priors
+        pos = pos.clip(
+            np.array(self.dist_priors)[:,0] * (1 + self.EPS),
+            np.array(self.dist_priors)[:,1] * (1 - self.EPS)
+        )
 
         # do MCMC for events up to event index wv_ind
-        iterator = range(counts.shape[0])
-        if show_progress:
-            iterator = tqdm(iterator)
-        for wv_ind in iterator:
-            # initialize sampler
-            sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, log_probability,
-                args=(counts[:wv_ind+1,:],)
+
+        # arguments needed to be passed to helper function
+        subseq_args = [(counts[:wv_ind+1,:], pos, nwalkers, ndim, nint, nsteps) 
+                        for wv_ind in range(counts.shape[0])]
+
+        # if parallelizing with Multiprocessing
+        if self.parallel:
+            with Pool() as pool:
+                parallel_args = (self._count_mc_seq, subseq_args)
+                # whether to show progress with tqdm
+                if show_progress:
+                    samplers = list(
+                        tqdm(pool.imap(*parallel_args), total=counts.shape[0])
+                    )
+                else:
+                    samplers = pool.map(*parallel_args)
+        # if not parallelizing
+        else:
+            samplers = map(
+                self._count_mc_seq, 
+                tqdm(subseq_args) if show_progress else subseq_args
             )
-
-            sampler.run_mcmc(pos, nsteps, progress=True)
-
-            # save sampler results to list
-            samplers[wv_ind] = sampler
 
         return samplers
     
@@ -681,13 +752,28 @@ class DetectionPipeline:
         params, waveforms = self.sample_events(N, True)
 
         ### strain MCMC
-        hd_results = self.run_hd(waveforms, params)
+        # hd_results = self.run_hd(waveforms, params) #TODO:
 
         ### photon counting MCMC
         pc_results = self.run_pc(waveforms)
 
         ### return computed data
-        return PipelineResults(*hd_results, *pc_results)
+        # return PipelineResults(self, *hd_results, *pc_results) #TODO:
+
+@dataclass
+class PipelineResults:
+    """
+    Class for storing results from a pipeline run.
+    """
+    config: DetectionPipeline
+    event_samples: List[emcee.EnsembleSampler]
+    event_flat_samples: List[np.ndarray]
+    event_means: np.ndarray
+    event_stds: np.ndarray
+    astro_samples: List[emcee.EnsembleSampler]
+    astro_flat_samples: List[np.ndarray]
+    pc_astro_samples: List[emcee.EnsembleSampler]
+    pc_astro_flat_samples: List[np.ndarray]
 
 if __name__ == "__main__":
     p = DetectionPipeline(f_low=2450, f_high=2550,
