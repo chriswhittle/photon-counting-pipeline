@@ -303,3 +303,10 @@ TSWLatexianTemp*
 # REVTeX puts footnotes in the bibliography by default, unless the nofootinbib
 .vscode/*
 *.DS_Store
+
+# pycache
+__pycache__/
+
+# Python notebooks for development
+*.ipynb
+*.ipynb_checkpoints
