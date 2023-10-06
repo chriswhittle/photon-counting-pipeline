@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List
 from inspect import signature
+from warnings import warn
 
 import numpy as np
 from scipy.constants import c, hbar
@@ -39,7 +40,7 @@ class DetectionPipeline:
                  detector='CE1', waveform_func=waveform.lorentzian,
                  snr_cutoff=0.2, param_means=None, param_stds=None,
                  mcmc_mask=None, priors=None, dist_priors=None,
-                 template_params=None, parallel=True):
+                 hd_gaussian=False, template_params=None, parallel=True):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -66,6 +67,10 @@ class DetectionPipeline:
                 inferred parameter for the astrophysical distribution
                 in the format [mean_lims | std_lims] =
                 [(mean_lower, mean_upper), ..., (std_lower, std_upper), ...]
+            hd_gaussian: whether to assume Gaussian posteriors for the
+                event parameters when computing the astrophysical posterior
+                (only appropriate for events above threshold that do not have
+                uniform posteriors)
             template_params: list of parameters for each template waveform for
                 photon counting detection
             parallel: whether to use Multiprocessing parallelization
@@ -127,6 +132,11 @@ class DetectionPipeline:
         self._DIST_WALKER_STD = [
             (p[1]-p[0])*self.WALKER_STD for p in self.dist_priors
         ]
+
+        # whether to assume Gaussian posteriors for event parameters
+        self.hd_gaussian = hd_gaussian
+        if self.hd_gaussian and self.snr_cutoff < 1:
+            warn("Gaussian posteriors should not be assumed for subthreshold events")
 
         # parameters with non-zero standard deviation need to be included in
         # MCMC; parameters not inferred should have zero variance
@@ -340,7 +350,7 @@ class DetectionPipeline:
     DEFAULT_STEPS = 5000
 
     DEFAULT_WALKERS = 50 #TODO:
-    DEFAULT_STEPS = 300 #TODO:
+    DEFAULT_STEPS = 1000 #TODO:
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -395,11 +405,30 @@ class DetectionPipeline:
             np.abs(strain - model) ** 2 / self.noise_total
             + np.log(self.noise_total)
         )
-    
 
-    def log_likelihood_hd(self, theta, param_means, param_stds):
+    def log_likelihood_hd(self, theta, event_post):
         """
-        Log-likelihood function for hyper-parameter MCMC on homodyne detection.
+        Log-likelihood function for hyper-parameter MCMC on homodyne detection,
+        doing full integration based on event posteriors.
+            theta: array of parameters
+            event_post: posterior distribution of event parameters, numpy array
+                of shape (no. of events, no. of MCMC samples, no. of params)
+        """
+        # separate inferred parameters into means and stds
+        means = theta[:self.ndim_p]
+        stds = theta[self.ndim_p:]
+
+        return -0.5 * np.sum(
+            (event_post - means)**2 / stds**2
+            + np.log(stds**2)
+        )
+
+    def log_likelihood_hd_gaussian(self, theta, param_means, param_stds):
+        """
+        Log-likelihood function for hyper-parameter MCMC on homodyne detection,
+        assuming the event posteriors are Gaussian. Inappropriate for
+        subthreshold events, which will result in uninformative (uniform)
+        posteriors.
             theta: array of parameters
             param_means: matrix of means of inferred parameters
             param_stds: matrix of standard deviations of inferred parameters
@@ -551,12 +580,7 @@ class DetectionPipeline:
         )
 
         # run MCMC
-        try:
-            sampler.run_mcmc(pos, nsteps)
-        except ValueError:
-            print(p0)
-            print(self.priors)
-            print(pos[:5])
+        sampler.run_mcmc(pos, nsteps)
 
         return sampler
 
@@ -603,15 +627,25 @@ class DetectionPipeline:
 
             args: tuple of arguments
         """
-        # unpack arguments
-        param_means, param_stds, pos, nwalkers, ndim, nsteps = args
+        # use Gaussian likelihood only if hd_gaussian is True
+        if self.hd_gaussian:
+            likelihood_fn = self.log_likelihood_hd_gaussian
+
+            # unpack arguments
+            param_means, param_stds, pos, nwalkers, ndim, nsteps = args
+            likelihood_args = (param_means, param_stds, )
+        else:
+            likelihood_fn = self.log_likelihood_hd
+            
+            # unpack arguments
+            events_posterior, pos, nwalkers, ndim, nsteps = args
+            likelihood_args = (events_posterior, )
 
         # initialize sampler
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, self.log_probability,
             args=(
-                self.log_prior_dist, self.log_likelihood_hd,
-                param_means, param_stds,
+                self.log_prior_dist, likelihood_fn, *likelihood_args
                 )
         )
 
@@ -627,16 +661,15 @@ class DetectionPipeline:
 
         return sampler
 
-    def strain_dist_mc(self, param_means, param_stds,
+    def strain_dist_mc(self, event_data,
                        nwalkers=None, nsteps=None, show_progress=True):
         """
         Compute the cumulative estimate of the astrophysical distribution
         parameters (mean and standard deviation) given the parameters inferred
         for individual events (and their errors).
-            param_means: array of size (no. of events) x (no. of params)
-                containing the inferred parameters means
-            param_stds: array of the same size containing the standard
-                deviations on the inferred parameters
+            event_data: either (param_means, param_stds) tuple of 
+                (no. of event) x (no. of params) numpy arrays if hd_gaussian
+                is true, otherwise the event Posteriors object
             nwalkers: number of walkers to use in MCMC
             nsteps: number of steps to take
             show_progress: whether to show progress bar
@@ -659,11 +692,22 @@ class DetectionPipeline:
         pos = self._init_walkers(pos, nwalkers, ndim, self.dist_priors)
 
         # arguments needed to be passed to helper function
-        subseq_args = [
-            (param_means[:wv_ind+1], param_stds[:wv_ind+1], pos,
-            nwalkers, ndim, nsteps) 
-            for wv_ind in range(param_means.shape[0])
-        ]
+        if self.hd_gaussian:
+            # only expect and need to pass posterior means/stds if Gaussian
+            param_means, param_stds = event_data
+            subseq_args = [
+                (param_means[:wv_ind+1], param_stds[:wv_ind+1], pos,
+                nwalkers, ndim, nsteps) 
+                for wv_ind in range(param_means.shape[0])
+            ]
+        else:
+            # need to pass the full posterior samples if not Gaussian
+            # (omit amplitude parameter)
+            events_posterior = np.array(event_data.flat_samples)
+            subseq_args = [
+                (events_posterior[:wv_ind+1,:,1:], pos, nwalkers, ndim, nsteps) 
+                for wv_ind in range(events_posterior.shape[0])
+            ]
 
         samplers = self._launch_mcmc_threads(
             self._strain_dist_mc_seq, subseq_args, show_progress
@@ -774,7 +818,10 @@ class DetectionPipeline:
             stds[i,:] = np.std(event_posterior.flat_samples[i], axis=0)[1:]
         
         # do MCMC on astrophysical population
-        hd_samplers = self.strain_dist_mc(means, stds)
+        if self.hd_gaussian:
+            hd_samplers = self.strain_dist_mc((means, stds))
+        else:
+            hd_samplers = self.strain_dist_mc(event_posterior)
 
         return (event_posterior, means, stds,
                 Posterior(hd_samplers))
