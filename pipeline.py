@@ -319,7 +319,7 @@ class DetectionPipeline:
         # mean fields in output templates
         # units of sqrt(quanta) TODO: check this
         mean_counts = np.zeros(
-            (strain.shape[1], self.templates.shape[1]), dtype=np.complex
+            (strain.shape[1], self.templates.shape[1]), dtype=complex
         )
         for i, template in enumerate(self.templates.T):
             mean_counts[:, i] = self.inner_product(
@@ -347,7 +347,8 @@ class DetectionPipeline:
 
     # default parameters for MCMC
     DEFAULT_WALKERS = 50
-    DEFAULT_STEPS = 15000
+    DEFAULT_STEPS_EVENT = 2000
+    DEFAULT_STEPS_DIST = 10000
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -605,7 +606,7 @@ class DetectionPipeline:
         if nwalkers is None:
             nwalkers = self.DEFAULT_WALKERS
         if nsteps is None:
-            nsteps = self.DEFAULT_STEPS
+            nsteps = self.DEFAULT_STEPS_EVENT
 
         # number of parameters to infer (one for each intrinsic parameter 
         # plus one for amplitude as a proxy for distance)
@@ -681,7 +682,7 @@ class DetectionPipeline:
         if nwalkers is None:
             nwalkers = self.DEFAULT_WALKERS
         if nsteps is None:
-            nsteps = self.DEFAULT_STEPS
+            nsteps = self.DEFAULT_STEPS_DIST
 
         # number of parameters to infer: two (mean and std) for each
         # intrinsic parameter; parameters in order of [means | stds]
@@ -756,7 +757,7 @@ class DetectionPipeline:
         if nwalkers is None:
             nwalkers = self.DEFAULT_WALKERS
         if nsteps is None:
-            nsteps = self.DEFAULT_STEPS
+            nsteps = self.DEFAULT_STEPS_DIST
 
         # number of parameters to infer: two (mean and std) for each
         # intrinsic parameter; parameters in order of [means | stds]
@@ -819,7 +820,7 @@ class DetectionPipeline:
             # (excluding amplitude parameter)
             means[i,:] = np.mean(event_posterior.flat_samples[i], axis=0)[1:]
             stds[i,:] = np.std(event_posterior.flat_samples[i], axis=0)[1:]
-        
+
         # do MCMC on astrophysical population
         if self.hd_gaussian:
             hd_samplers = self.strain_dist_mc((means, stds))
