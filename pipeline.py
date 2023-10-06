@@ -399,6 +399,26 @@ class DetectionPipeline:
             np.abs(strain - model) ** 2 / self.noise_total
             + np.log(self.noise_total)
         )
+    
+
+    def log_likelihood_hd(self, theta, param_means, param_stds):
+        """
+        Log-likelihood function for hyper-parameter MCMC on homodyne detection.
+            theta: array of parameters
+            param_means: matrix of means of inferred parameters
+            param_stds: matrix of standard deviations of inferred parameters
+        """
+        # separate inferred parameters into means and stds
+        means = theta[:self.ndim_p]
+        stds = theta[self.ndim_p:]
+
+        # pre-compute sum of astrophysical stds and inferred event-wise stds
+        std_sum2 = stds**2 + param_stds**2
+
+        # compute log likelihood for Gaussian distributions
+        return -0.5 * np.sum(
+            (means - param_means)**2 / std_sum2 + np.log(std_sum2)
+        )
 
     def log_likelihood_pc(self, theta, counts, nint=100):
         """
@@ -459,12 +479,23 @@ class DetectionPipeline:
         spread = np.array([
             (p[1]-p[0])*self.WALKER_STD for p in priors
         ])
+        
+        # get indices of true parameters values that are zero
+        zero_inds = (true_values == 0)
+
+        # compute relative spreads for non-zero values
+        rel_spread = spread.copy()
+        rel_spread[~zero_inds] /= true_values[~zero_inds]
 
         # scatter walkers about true values
         pos = true_values * (
             1 + np.random.randn(nwalkers, ndim) * 
-            np.minimum(np.abs(spread/true_values), self.WALKER_STD_MAX)
+            np.minimum(np.abs(rel_spread), self.WALKER_STD_MAX)
         )
+
+        # add small scatter to zero values
+        if np.any(zero_inds):
+            pos[:, zero_inds] += np.random.randn(nwalkers, zero_inds.sum()) * self.EPS
 
         # force initial positions to be within the priors
         pos = pos.clip(
@@ -472,6 +503,35 @@ class DetectionPipeline:
         )
 
         return pos
+    
+    def _launch_mcmc_threads(self, mcmc_fn, args, show_progress=True):
+        """
+        Handle logic of mapping model inputs to MCMC jobs and handle logic for
+        parallelizing and showing progress.
+            mcmc_fn: function to use for MCMC
+            args: arguments to pass to mcmc_fn
+            size: size of job list to be computed
+            show_progress: whether to show progress bar
+        """
+        # if parallelizing with Multiprocessing
+        if self.parallel:
+            with Pool() as pool:
+                parallel_args = (mcmc_fn, args)
+                # whether to show progress with tqdm
+                if show_progress:
+                    samplers = list(
+                        tqdm(pool.imap(*parallel_args), total=len(args))
+                    )
+                else:
+                    samplers = pool.map(*parallel_args)
+        # if not parallelizing
+        else:
+            samplers = map(
+                mcmc_fn, 
+                tqdm(args) if show_progress else args
+            )
+        
+        return samplers
 
     def _strain_mc(self, args):
         """
@@ -531,26 +591,43 @@ class DetectionPipeline:
             (strains[:, wv_ind], p0[:, wv_ind], nwalkers, ndim, nsteps) 
             for wv_ind in range(strains.shape[1])
         ]
-        
-        # if parallelizing with Multiprocessing
-        if self.parallel:
-            with Pool() as pool:
-                parallel_args = (self._strain_mc, subseq_args)
-                # whether to show progress with tqdm
-                if show_progress:
-                    samplers = list(
-                        tqdm(pool.imap(*parallel_args), total=strains.shape[1])
-                    )
-                else:
-                    samplers = pool.map(*parallel_args)
-        # if not parallelizing
-        else:
-            samplers = map(
-                self._strain_mc, 
-                tqdm(subseq_args) if show_progress else subseq_args
-            )
-        
+
+        samplers = self._launch_mcmc_threads(
+            self._strain_mc, subseq_args, show_progress
+        )
+
         return samplers
+
+    def _strain_dist_mc_seq(self, args):
+        """
+        Helper function for parallelizing strain MCMC by performing MCMC 
+        on a subsequence of events. Needs to be top-level to be pickle-able.
+
+            args: tuple of arguments
+        """
+        # unpack arguments
+        param_means, param_stds, pos, nwalkers, ndim, nsteps = args
+
+        # initialize sampler
+        sampler = emcee.EnsembleSampler(
+            nwalkers, ndim, self.log_probability,
+            args=(
+                self.log_prior_dist, self.log_likelihood_hd,
+                param_means, param_stds,
+                )
+        )
+
+        # run MCMC
+        try:
+            sampler.run_mcmc(pos, nsteps)
+        except ValueError:
+            print('---')
+            print(param_means)
+            print(param_stds)
+            print(pos[:5])
+            print('---')
+
+        return sampler
 
     def strain_dist_mc(self, param_means, param_stds,
                        nwalkers=None, nsteps=None, show_progress=True):
@@ -576,33 +653,6 @@ class DetectionPipeline:
         # intrinsic parameter; parameters in order of [means | stds]
         ndim = 2*self.ndim_p
 
-        # uniform priors
-        def log_prior(theta):
-            if all([p[0] < x < p[1] for p, x in zip(self.dist_priors, theta)]):
-                return 0.0
-            return -np.inf
-
-        # log likelihood assuming event-wise posteriors are Gaussian
-        def log_likelihood(theta, param_means, param_stds):
-            # separate inferred parameters into means and stds
-            means = theta[:self.ndim_p]
-            stds = theta[self.ndim_p:]
-
-            # pre-compute sum of astrophysical stds and inferred event-wise stds
-            std_sum2 = stds**2 + param_stds**2
-
-            # compute log likelihood for Gaussian distributions
-            return -0.5 * np.sum(
-                (means - param_means)**2 / std_sum2 + np.log(std_sum2)
-            )
-        
-        # probability = prior * likelihood
-        def log_probability(theta, means, stds):
-            lp = log_prior(theta)
-            if not np.isfinite(lp):
-                return -np.inf
-            return lp + log_likelihood(theta, means, stds)
-
         # use actual astrophysical means and standard deviations as initial
         # positions for walkers
         pos = np.concatenate(
@@ -610,24 +660,16 @@ class DetectionPipeline:
         )
         pos = self._init_walkers(pos, nwalkers, ndim, self.dist_priors)
 
-        # save MCMC results in a list
-        samplers = [None] * param_means.shape[0]
+        # arguments needed to be passed to helper function
+        subseq_args = [
+            (param_means[:wv_ind+1], param_stds[:wv_ind+1], pos,
+            nwalkers, ndim, nsteps) 
+            for wv_ind in range(param_means.shape[0])
+        ]
 
-        # do MCMC for events up to event index wv_ind
-        iterator = range(param_means.shape[0])
-        if show_progress:
-            iterator = tqdm(iterator)
-        for wv_ind in iterator:
-            # initialize sampler
-            sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, log_probability,
-                args=(param_means[:wv_ind+1], param_stds[:wv_ind+1])
-            )
-
-            sampler.run_mcmc(pos, nsteps, progress=True)
-
-            # save sampler results to list
-            samplers[wv_ind] = sampler
+        samplers = self._launch_mcmc_threads(
+            self._strain_dist_mc_seq, subseq_args, show_progress
+        )
 
         return samplers
 
@@ -688,23 +730,9 @@ class DetectionPipeline:
         subseq_args = [(counts[:wv_ind+1,:], pos, nwalkers, ndim, nint, nsteps) 
                         for wv_ind in range(counts.shape[0])]
 
-        # if parallelizing with Multiprocessing
-        if self.parallel:
-            with Pool() as pool:
-                parallel_args = (self._count_mc_seq, subseq_args)
-                # whether to show progress with tqdm
-                if show_progress:
-                    samplers = list(
-                        tqdm(pool.imap(*parallel_args), total=counts.shape[0])
-                    )
-                else:
-                    samplers = pool.map(*parallel_args)
-        # if not parallelizing
-        else:
-            samplers = map(
-                self._count_mc_seq, 
-                tqdm(subseq_args) if show_progress else subseq_args
-            )
+        samplers = self._launch_mcmc_threads(
+            self._count_mc_seq, subseq_args, show_progress
+        )
 
         return samplers
     
