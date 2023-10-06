@@ -8,6 +8,7 @@ from scipy.special import comb
 from scipy.linalg import orth
 import gwinc
 import emcee
+import pickle
 from multiprocessing import Pool
 from tqdm import tqdm
 
@@ -36,7 +37,7 @@ class DetectionPipeline:
 
     def __init__(self, f_sample=16384, bin_width=1, f_low=None, f_high=None,
                  detector='CE1', waveform_func=waveform.lorentzian,
-                 snr_cutoff=0.8, param_means=None, param_stds=None,
+                 snr_cutoff=0.2, param_means=None, param_stds=None,
                  mcmc_mask=None, priors=None, dist_priors=None,
                  template_params=None, parallel=True):
         """
@@ -69,6 +70,9 @@ class DetectionPipeline:
                 photon counting detection
             parallel: whether to use Multiprocessing parallelization
         """
+        # seeded random number generator to use throughout
+        self.rng = np.random.default_rng(0)
+
         # generate frequency bins
         self.bw = bin_width
         self.f = frequency_bins(f_sample, bin_width, f_low, f_high)
@@ -159,7 +163,7 @@ class DetectionPipeline:
             stds = self.param_stds
 
         # transpose so no. of samples is last dimension for broadcasting
-        return np.random.normal(means, stds, size=(N, len(self.param_means))).T
+        return self.rng.normal(means, stds, size=(N, len(self.param_means))).T
 
     def inner_product(self, a, b):
         """
@@ -209,7 +213,7 @@ class DetectionPipeline:
         # distance CDF = (distance/distance_max)^3
         # SNR CDF = 1 - (SNR_min/SNR)^3
         # SNR = SNR_min / (1 - random)*(1/3)
-        snr_samples = self.snr_cutoff / (1 - np.random.random(N))**(1/3)
+        snr_samples = self.snr_cutoff / (1 - self.rng.random(N))**(1/3)
 
         # draw parameters from Gaussian distributions
         param_samples = self.draw_params(N, means, stds)
@@ -265,8 +269,8 @@ class DetectionPipeline:
         """
         # simulate white noise with random phase (normalized to have unit standard
         # deviation in magnitude)
-        white_noise = (np.random.normal(size=(len(self.f), N))
-                    + 1j*np.random.normal(size=(len(self.f), N))) / np.sqrt(2)
+        white_noise = (self.rng.normal(size=(len(self.f), N))
+                    + 1j*self.rng.normal(size=(len(self.f), N))) / np.sqrt(2)
         
         # scale noise by PSD
         return white_noise * np.sqrt(psd[:, np.newaxis])
@@ -325,7 +329,7 @@ class DetectionPipeline:
             prob: (no. of realizations) x (no. of templates) matrix of probabilities
         Returns a matrix of the same shape with 0s and 1s.
         """
-        return np.array(np.random.random(prob.shape) > prob, dtype=np.int)
+        return np.array(self.rng.random(prob.shape) > prob, dtype=np.int)
 
     ##############################################################
     ###################### MCMC METHODS ##########################
@@ -337,14 +341,6 @@ class DetectionPipeline:
 
     DEFAULT_WALKERS = 50 #TODO:
     DEFAULT_STEPS = 300 #TODO:
-
-    # daefault discard and thin values walker chains
-    # discard should be ~ a few times the autocorrelation time
-    # thin should be ~ 1/2 the autocorrelation time
-    # https://emcee.readthedocs.io/en/stable/tutorials/line/
-    N_DISCARD = 50
-    N_THIN = 10
-    #TODO: look at autocorrelation and change
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -489,13 +485,15 @@ class DetectionPipeline:
 
         # scatter walkers about true values
         pos = true_values * (
-            1 + np.random.randn(nwalkers, ndim) * 
+            1 + self.rng.normal(size=(nwalkers, ndim)) * 
             np.minimum(np.abs(rel_spread), self.WALKER_STD_MAX)
         )
 
         # add small scatter to zero values
         if np.any(zero_inds):
-            pos[:, zero_inds] += np.random.randn(nwalkers, zero_inds.sum()) * self.EPS
+            pos[:, zero_inds] += self.rng.normal(
+                size=(nwalkers, zero_inds.sum())
+            ) * self.EPS
 
         # force initial positions to be within the priors
         pos = pos.clip(
@@ -765,25 +763,21 @@ class DetectionPipeline:
         # compute mean and standard deviation from walkers for each event
         means = np.zeros((N, len(self.param_means)))
         stds = np.zeros((N, len(self.param_means)))
-        flat_samples = [None]*N
+
+        # flatten samples
+        event_posterior = Posterior(samplers)
+
         for i, s in enumerate(samplers):
-            # flatten MCMC samples
-            flat_samples[i] = s.get_chain(
-                discard=self.N_DISCARD, thin=self.N_THIN, flat=True
-            )
             # take the mean and standard deviation of all samples
             # (excluding amplitude parameter)
-            means[i,:] = np.mean(flat_samples[i], axis=0)[1:]
-            stds[i,:] = np.std(flat_samples[i], axis=0)[1:]
+            means[i,:] = np.mean(event_posterior.flat_samples[i], axis=0)[1:]
+            stds[i,:] = np.std(event_posterior.flat_samples[i], axis=0)[1:]
         
         # do MCMC on astrophysical population
-        astro_samplers = self.strain_dist_mc(means, stds)
-        flat_astros = [s.get_chain(
-            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
-        ) for s in astro_samplers]
+        hd_samplers = self.strain_dist_mc(means, stds)
 
-        return (samplers, flat_samples, means, stds,
-                astro_samplers, flat_astros,)
+        return (event_posterior, means, stds,
+                Posterior(hd_samplers))
 
     def run_pc(self, raw_waveforms):
         """
@@ -807,21 +801,27 @@ class DetectionPipeline:
 
         # do photon counting MCMC
         pc_samplers = self.count_mc(photon_counts)
-        pc_flat_astros = [s.get_chain(
-            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
-        ) for s in pc_samplers]
 
-        return pc_samplers, pc_flat_astros
+        return (Posterior(pc_samplers), )
 
-    def run(self, N):
+    def run(self, N, snr_sorted=False):
         """
         Simulate events with detector noise, infer distribution parameters
         with MCMC on the strain and photon counts.
 
             N: number of astrophysical events to simulate
+            snr_sorted: whether to sort events by SNR before doing MCMC
         """
         # draw event parameters and simulate waveforms
         params, waveforms = self.sample_events(N, True)
+
+        # sort events by distance and perform hyper-MCMC on sorted events
+        snrs = self.compute_snr(waveforms)
+        if snr_sorted:
+            sorted_inds = np.argsort(snrs)[::-1]
+
+            waveforms = waveforms[:, sorted_inds]
+            params = params[:, sorted_inds]
 
         ### strain MCMC
         hd_results = self.run_hd(waveforms, params)
@@ -830,22 +830,63 @@ class DetectionPipeline:
         pc_results = self.run_pc(waveforms)
 
         ### return computed data
-        return PipelineResults(self, *hd_results, *pc_results)
+        return PipelineResults(self, snrs, *hd_results, *pc_results)
+
+class Posterior:
+    # daefault discard and thin values walker chains
+    # discard should be ~ a few times the autocorrelation time
+    # thin should be ~ 1/2 the autocorrelation time
+    # https://emcee.readthedocs.io/en/stable/tutorials/line/
+    N_DISCARD = 50
+    N_THIN = 10
+    #TODO: look at autocorrelation and change
+
+    def __init__(self, samples, hyper=True):
+        self.samples = samples
+        self.flat_samples = [s.get_chain(
+            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
+        ) for s in samples]
+
+        # whether this posterior is for the astrophysical hyper-parameters
+        self.hyper = hyper
 
 @dataclass
 class PipelineResults:
     """
     Class for storing results from a pipeline run.
     """
-    config: DetectionPipeline
-    event_samples: List[emcee.EnsembleSampler]
-    event_flat_samples: List[np.ndarray]
+    pipeline: DetectionPipeline
+
+    # list of event SNRs
+    event_snrs: np.ndarray
+
+    # individual event inferences from homodyne detection
+    event_posterior: Posterior
     event_means: np.ndarray
     event_stds: np.ndarray
-    astro_samples: List[emcee.EnsembleSampler]
-    astro_flat_samples: List[np.ndarray]
-    pc_astro_samples: List[emcee.EnsembleSampler]
-    pc_astro_flat_samples: List[np.ndarray]
+
+    # hyper-posterior from homodyne detection
+    hd_posterior: Posterior
+
+    # hyper-posterior from photon counting
+    pc_posterior: Posterior
+
+    def save(self, filename):
+        """
+        Save PipelineResults object to a pickle file.
+            filename: path to pickle file
+        """
+        with open(filename, 'wb') as file:
+            pickle.dump(self, file)
+
+    @staticmethod
+    def load(filename):
+        """
+        Load contents from a pickle file into a PipelineResults object.
+            filename: path to pickle file
+        """
+        with open(filename, 'rb') as file:
+            return pickle.load(file)
 
 if __name__ == "__main__":
     p = DetectionPipeline(f_low=2450, f_high=2550,
