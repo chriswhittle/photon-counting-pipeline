@@ -119,6 +119,11 @@ class DetectionPipeline:
         self.dist_priors = dist_priors
         assert(self.dist_priors is not None)
 
+        # scatter for MCMC walkers
+        self._DIST_WALKER_STD = [
+            (p[1]-p[0])*self.WALKER_STD for p in self.dist_priors
+        ]
+
         # parameters with non-zero standard deviation need to be included in
         # MCMC; parameters not inferred should have zero variance
         for i, std in enumerate(self.param_stds):
@@ -342,9 +347,9 @@ class DetectionPipeline:
     #TODO: look at autocorrelation and change
 
     # constants for setting up walker initial positions
-    EPS = 1e-3
     WALKER_STD = 3e-1
-
+    WALKER_STD_MAX = 1e-1
+    EPS = 1e-3
 
     ### prior, likelihood, probability functions
     # these need to be top-level to be pickle-able by Multiprocessing
@@ -374,9 +379,30 @@ class DetectionPipeline:
         """
         return self.log_prior(theta, self.dist_priors)
 
+    def log_likelihood_event(self, theta, strain):
+        """
+        Log-likelihood function using Gaussian noise, e.g. (5) from
+        PASA vol. 36 e10.
+            theta: array of parameters
+            strain: strain waveform
+        """
+        # use distribution mean values for parameters that are not being
+        # inferred
+        params = self.param_means.copy()
+        params[self.mcmc_mask] = theta[1:]
+
+        # compute waveform and scale by amplitude
+        model = self.waveform(params) * theta[0]
+
+        # compute log likelihood for Gaussian noise
+        return -0.5 * np.sum(
+            np.abs(strain - model) ** 2 / self.noise_total
+            + np.log(self.noise_total)
+        )
+
     def log_likelihood_pc(self, theta, counts, nint=100):
         """
-        Likelihood function for photon counting.
+        Log-likelihood function for photon counting.
             theta: array of parameters
             counts: array of photon counts
         """
@@ -420,6 +446,62 @@ class DetectionPipeline:
 
     ### MCMC functions
 
+    def _init_walkers(self, true_values, nwalkers, ndim, priors):
+        """
+        Initialize walkers for MCMC by scattering the true values by an amount
+        proportional to the prior width, up to a maximum of WALKER_STD_MAX.
+            true_values: true parameter values
+            nwalkers: number of walkers
+            ndim: number of parameters
+            spread: amount to scatter by
+        """
+        # compute scatter for walkers as a fraction of the prior width
+        spread = np.array([
+            (p[1]-p[0])*self.WALKER_STD for p in priors
+        ])
+
+        # scatter walkers about true values
+        pos = true_values * (
+            1 + np.random.randn(nwalkers, ndim) * 
+            np.minimum(np.abs(spread/true_values), self.WALKER_STD_MAX)
+        )
+
+        # force initial positions to be within the priors
+        pos = pos.clip(
+            np.array(priors)[:,0], np.array(priors)[:,1]
+        )
+
+        return pos
+
+    def _strain_mc(self, args):
+        """
+        Helper function for parallelizing event parameter estimation. Needs to
+        be top-level to be pickle-able.
+
+            args: tuple of arguments
+        """
+        # unpack arguments
+        wv, p0, nwalkers, ndim, nsteps = args
+
+        # use actual parameters as initial guesses with some scatter
+        pos = self._init_walkers(p0, nwalkers, ndim, self.priors)
+
+        # initialize sampler
+        sampler = emcee.EnsembleSampler(
+            nwalkers, ndim, self.log_probability,
+            args=(self.log_prior_event, self.log_likelihood_event, wv,)
+        )
+
+        # run MCMC
+        try:
+            sampler.run_mcmc(pos, nsteps)
+        except ValueError:
+            print(p0)
+            print(self.priors)
+            print(pos[:5])
+
+        return sampler
+
     def strain_mc(self, strains, p0, nwalkers=None, nsteps=None,
                   show_progress=True):
         """
@@ -442,62 +524,31 @@ class DetectionPipeline:
 
         # number of parameters to infer (one for each intrinsic parameter 
         # plus one for amplitude as a proxy for distance)
-        ndim = np.sum(self.mcmc_mask) + 1
+        ndim = self.ndim_p + 1
 
-        # uniform priors
-        def log_prior(theta):
-            if all([p[0] < x < p[1] for p, x in zip(self.priors, theta)]):
-                return 0.0
-            return -np.inf
-
-        # log likelihood using Gaussian noise, e.g. (5) from PASA vol. 36 e10
-        def log_likelihood(theta, strain):
-            # use distribution mean values for parameters that are not being
-            # inferred
-            params = self.param_means.copy()
-            params[self.mcmc_mask] = theta[1:]
-
-            # compute waveform and scale by amplitude
-            model = self.waveform(params) * theta[0]
-
-            # compute log likelihood for Gaussian noise
-            return -0.5 * np.sum(
-                np.abs(strain - model) ** 2 / self.noise_total
-                + np.log(self.noise_total)
-            )
+        # arguments needed to be passed to helper function
+        subseq_args = [
+            (strains[:, wv_ind], p0[:, wv_ind], nwalkers, ndim, nsteps) 
+            for wv_ind in range(strains.shape[1])
+        ]
         
-        # probability = prior * likelihood
-        def log_probability(theta, strain):
-            lp = log_prior(theta)
-            if not np.isfinite(lp):
-                return -np.inf
-            return lp + log_likelihood(theta, strain)
-
-        # save MCMC results in a list
-        samplers = [None] * strains.shape[1]
-
-        # iterate over each event for MCMC
-        iterator = range(strains.shape[1])
-        if show_progress:
-            iterator = tqdm(iterator)
-        for wv_ind in iterator:
-            # select individual strain for this event
-            wv = strains[:, wv_ind]
-
-            # use actual parameters as initial guesses with some noise
-            pos = (p0[:, wv_ind] * 
-                   (1 + np.random.randn(nwalkers, ndim)*self.WALKER_STD)
-                )
-
-            # construct sampler and run MCMC
-            sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, log_probability,
-                args=(wv,)
+        # if parallelizing with Multiprocessing
+        if self.parallel:
+            with Pool() as pool:
+                parallel_args = (self._strain_mc, subseq_args)
+                # whether to show progress with tqdm
+                if show_progress:
+                    samplers = list(
+                        tqdm(pool.imap(*parallel_args), total=strains.shape[1])
+                    )
+                else:
+                    samplers = pool.map(*parallel_args)
+        # if not parallelizing
+        else:
+            samplers = map(
+                self._strain_mc, 
+                tqdm(subseq_args) if show_progress else subseq_args
             )
-            sampler.run_mcmc(pos, nsteps, progress=True)
-
-            # save sampler results to list
-            samplers[wv_ind] = sampler
         
         return samplers
 
@@ -557,9 +608,7 @@ class DetectionPipeline:
         pos = np.concatenate(
             (self.param_means[self.mcmc_mask], self.param_stds[self.mcmc_mask])
         )
-        # some extra scatter on walker initial positions
-        pos = (pos * (1 + np.random.randn(nwalkers, ndim)*self.WALKER_STD) 
-               + np.random.randn(nwalkers, ndim)*self.WALKER_STD)
+        pos = self._init_walkers(pos, nwalkers, ndim, self.dist_priors)
 
         # save MCMC results in a list
         samplers = [None] * param_means.shape[0]
@@ -631,12 +680,7 @@ class DetectionPipeline:
         pos = np.concatenate(
             (self.param_means[self.mcmc_mask], self.param_stds[self.mcmc_mask])
         )
-        pos = pos * (1 + np.random.randn(nwalkers, ndim)/10) + np.random.randn(nwalkers, ndim)/10
-        # force initial positions to be within the priors
-        pos = pos.clip(
-            np.array(self.dist_priors)[:,0] * (1 + self.EPS),
-            np.array(self.dist_priors)[:,1] * (1 - self.EPS)
-        )
+        pos = self._init_walkers(pos, nwalkers, ndim, self.dist_priors)
 
         # do MCMC for events up to event index wv_ind
 
@@ -752,13 +796,13 @@ class DetectionPipeline:
         params, waveforms = self.sample_events(N, True)
 
         ### strain MCMC
-        # hd_results = self.run_hd(waveforms, params) #TODO:
+        hd_results = self.run_hd(waveforms, params)
 
         ### photon counting MCMC
         pc_results = self.run_pc(waveforms)
 
         ### return computed data
-        # return PipelineResults(self, *hd_results, *pc_results) #TODO:
+        return PipelineResults(self, *hd_results, *pc_results)
 
 @dataclass
 class PipelineResults:
