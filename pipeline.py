@@ -346,11 +346,8 @@ class DetectionPipeline:
     ##############################################################
 
     # default parameters for MCMC
-    DEFAULT_WALKERS = 100
-    DEFAULT_STEPS = 5000
-
-    DEFAULT_WALKERS = 50 #TODO:
-    DEFAULT_STEPS = 1000 #TODO:
+    DEFAULT_WALKERS = 50
+    DEFAULT_STEPS = 15000
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -406,7 +403,7 @@ class DetectionPipeline:
             + np.log(self.noise_total)
         )
 
-    def log_likelihood_hd(self, theta, event_post):
+    def log_likelihood_hd(self, theta, event_post, nint=100):
         """
         Log-likelihood function for hyper-parameter MCMC on homodyne detection,
         doing full integration based on event posteriors.
@@ -417,6 +414,12 @@ class DetectionPipeline:
         # separate inferred parameters into means and stds
         means = theta[:self.ndim_p]
         stds = theta[self.ndim_p:]
+
+        # flatten first two dimensions of event_post
+        event_post = event_post.reshape(-1, event_post.shape[-1])
+        # randomly choose samples to integrate over
+        int_inds = self.rng.choice(event_post.shape[0], nint)
+        event_post = event_post[int_inds, :]
 
         return -0.5 * np.sum(
             (event_post - means)**2 / stds**2
@@ -883,16 +886,20 @@ class Posterior:
     # daefault discard and thin values walker chains
     # discard should be ~ a few times the autocorrelation time
     # thin should be ~ 1/2 the autocorrelation time
+    # use ~80 for autocorrelation time
     # https://emcee.readthedocs.io/en/stable/tutorials/line/
-    N_DISCARD = 50
-    N_THIN = 10
-    #TODO: look at autocorrelation and change
+    N_DISCARD = 500
+    N_THIN = 50
 
     def __init__(self, samples, hyper=True):
         self.samples = samples
+        # flatten chain samples
         self.flat_samples = [s.get_chain(
             discard=self.N_DISCARD, thin=self.N_THIN, flat=True
         ) for s in samples]
+        
+        # compute autocorrelation times
+        # self.autocorr_times = [s.get_autocorr_time() for s in samples]
 
         # whether this posterior is for the astrophysical hyper-parameters
         self.hyper = hyper
@@ -936,22 +943,23 @@ class PipelineResults:
             return pickle.load(file)
 
 if __name__ == "__main__":
-    p = DetectionPipeline(f_low=2450, f_high=2550,
-                            param_means=[2500, 10, 0, 0],
-                            param_stds=[10, 5, 1, 0.3],
+    p = DetectionPipeline(f_low=2300, f_high=2700, bin_width=2,
+                            param_means=[2400, 30, 0, 0],
+                            param_stds=[50, 10, 1, 0.3],
                             template_params=[
-                                [2500, 10, 0, 0],
-                                [2530, 10, 0, 0],
+                                [2400, 200, 0, 0],
+                                [2600, 200, 0, 0],
                             ],
                             priors=[
-                                (0, 1e-18), (2400, 2600), (0.1, 50),
-                                (-2*np.pi, 2*np.pi), (0, 1)
+                                (0, 1e-18), (500, 6000), (1, 500),
+                                (-2*np.pi, 2*np.pi), (-2, 2)
                             ],
                             dist_priors=[
-                                (0, 5000), (0.1, 100),
+                                (0, 5000), (1, 60),
                                 (-2*np.pi, 2*np.pi), (0, 1),
                                 (0.1, 1000), (0.1, 100),
                                 (0.1, 2*np.pi), (0.1, 1)
-                            ])
+                            ],
+                            parallel=True)
     
-    p.run(3)
+    p.run(20)
