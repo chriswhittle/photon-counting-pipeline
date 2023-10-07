@@ -123,6 +123,7 @@ class DetectionPipeline:
         # priors for parameters of astrophysical distribution
         self.dist_priors = dist_priors
         assert(self.dist_priors is not None)
+        assert(len(self.dist_priors) == 2*self.ndim_p)
 
         # scatter for MCMC walkers
         self._DIST_WALKER_STD = [
@@ -249,7 +250,7 @@ class DetectionPipeline:
         Compute and return unit wavelets with the given parameters.
             f: numpy array of equally-spaced frequency bins
             params: list/array of waveform parameter values with shape
-                (parameters x samples)
+                (parameters, samples)
         """
         # duplicate f across a new axis for broadcasting
         # if params is 2-dimensional
@@ -310,10 +311,10 @@ class DetectionPipeline:
         Given a series of strain spectra, convert to output optical power and then
         subsequently to "probability of observing zero photos" in each optical mode
         at the output.
-            strain: (no. of frequencies) x (no. of realizations) array of strain
+            strain: (no. of frequencies, no. of realizations) array of strain
             budget: gwinc budget object, e.g. gwinc.load_budget(ifo) where ifo is
                 one of 'aLIGO', 'CE1' etc.
-        Returns matrix (no. of realizations) x (no. of templates) of probabilities
+        Returns matrix (no. of realizations, no. of templates) of probabilities
         """
         # output fields
         output_fields = strain * self.ifo_calibration
@@ -338,7 +339,7 @@ class DetectionPipeline:
         Given a matrix of probabilities of observing zero photons in each 
         realization for each template mode, randomly populate each with 0 or 1
         photons.
-            prob: (no. of realizations) x (no. of templates) matrix of probabilities
+            prob: (no. of realizations, no. of templates) matrix of probabilities
         Returns a matrix of the same shape with 0s and 1s.
         """
         return np.array(self.rng.random(prob.shape) > prob, dtype=int)
@@ -349,7 +350,7 @@ class DetectionPipeline:
 
     # default parameters for MCMC
     DEFAULT_WALKERS = 50
-    DEFAULT_STEPS_EVENT = 1000
+    DEFAULT_STEPS_EVENT = 1500
     DEFAULT_STEPS_DIST = 2000
 
     # constants for setting up walker initial positions
@@ -359,16 +360,6 @@ class DetectionPipeline:
 
     ### prior, likelihood, probability functions
     # these need to be top-level to be pickle-able by Multiprocessing
-
-    def log_prior(self, theta, priors):
-        """
-        Compute the uniform log-prior for the given parameters.
-            theta: array of parameters
-            priors: list of tuples of (lower, upper) bounds for each parameter
-        """
-        if all([p[0] <= x <= p[1] for p, x in zip(priors, theta)]):
-            return 0.0
-        return -np.inf
     
     def log_prior_event(self, theta):
         """
@@ -417,6 +408,16 @@ class DetectionPipeline:
 
         # use math.log for scalar performance
         return -np.inf if prior <= 0 else math.log(prior)
+
+    def log_prior(self, theta, priors):
+        """
+        Compute the uniform log-prior for the given parameters.
+            theta: array of parameters
+            priors: list of tuples of (lower, upper) bounds for each parameter
+        """
+        if all([p[0] <= x <= p[1] for p, x in zip(priors, theta)]):
+            return 0.0
+        return -np.inf
 
     def log_prior_dist(self, theta):
         """
@@ -498,9 +499,14 @@ class DetectionPipeline:
             theta: array of parameters
             counts: array of photon counts
         """
+        # use distribution mean values for parameters that are not being
+        # inferred
+        means = self.param_means.copy()
+        stds = self.param_stds.copy()
+
         # separate inferred parameters into means and stds
-        means = theta[:self.ndim_p]
-        stds = theta[self.ndim_p:]
+        means[self.mcmc_mask] = theta[:self.ndim_p]
+        stds[self.mcmc_mask] = theta[self.ndim_p:]
 
         # for this astrophysical distribution, compute the probabilities
         # of observing zero photons in each template mode by sampling
@@ -638,7 +644,7 @@ class DetectionPipeline:
         """
         Perform MCMC to infer the parameters of the given waveforms.
             f: array of frequencies
-            strain: (no. of frequencies) x (no. of realizations) array of strains
+            strain: (no. of frequencies, no. of realizations) array of strains
             noise_spectrum: noise power spectral density
             p0: initial guesses for the walkers, use e.g. actual parameters used to
                 generate the strains
@@ -710,7 +716,7 @@ class DetectionPipeline:
         parameters (mean and standard deviation) given the parameters inferred
         for individual events (and their errors).
             event_data: either (param_means, param_stds) tuple of 
-                (no. of event) x (no. of params) numpy arrays if hd_gaussian
+                (no. of event, no. of params) numpy arrays if hd_gaussian
                 is true, otherwise the event Posteriors object
             nwalkers: number of walkers to use in MCMC
             nsteps: number of steps to take
@@ -786,7 +792,7 @@ class DetectionPipeline:
         """
         Perform MCMC to infer the parameters of the given waveforms, after they have
         been filtered by output template filters and converted to photon counts.
-            counts: (no. of realizations) x (no. of templates) array of photon counts
+            counts: (no. of realizations, no. of templates) array of photon counts
             nwalkers: number of walkers to use in MCMC
             nwalkers: number of steps to use in MCMC
             show_progress: whether to show progress bar
@@ -830,8 +836,8 @@ class DetectionPipeline:
         MCMC to get the astrophysical hyper-posteriors.
 
             raw_waveforms: np arrays of shape
-            (no. of frequencies) x (no. of events)
-            params: np arrays of shape (no. of events) x (no. of parameters)
+            (no. of frequencies, no. of events)
+            params: np arrays of shape (no. of parameters, no. of events)
             with the true parameters used to generate the waveforms
         """
         # number of events
@@ -843,8 +849,11 @@ class DetectionPipeline:
             self.simulate_noise(N, self.noise_total)
         )
         
+        # pick out true values of parameters to be inferred (including amplitude)
+        sub_params = params[[True] + self.mcmc_mask, :]
+        
         # do event-wise MCMC on the simulate strains
-        samplers = self.strain_mc(waveforms_hd, params)
+        samplers = self.strain_mc(waveforms_hd, sub_params)
         
         # compute mean and standard deviation from walkers for each event
         means = np.zeros((N, len(self.param_means)))
@@ -874,7 +883,7 @@ class DetectionPipeline:
         MCMC to get the astrophysical hyper-posteriors.
 
             raw_waveforms: np arrays of shape
-            (no. of frequencies) x (no. of events)
+            (no. of frequencies, no. of events)
         """
         # number of events
         N = raw_waveforms.shape[1]
