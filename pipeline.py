@@ -3,9 +3,10 @@ from typing import List
 from inspect import signature
 from warnings import warn
 
+import math
 import numpy as np
 from scipy.constants import c, hbar
-from scipy.special import comb
+from scipy.special import comb, erf, expi
 from scipy.linalg import orth
 import gwinc
 import emcee
@@ -39,8 +40,8 @@ class DetectionPipeline:
     def __init__(self, f_sample=16384, bin_width=1, f_low=None, f_high=None,
                  detector='CE1', waveform_func=waveform.lorentzian,
                  snr_cutoff=0.2, param_means=None, param_stds=None,
-                 mcmc_mask=None, priors=None, dist_priors=None,
-                 hd_gaussian=False, template_params=None, parallel=True):
+                 mcmc_mask=None, dist_priors=None, hd_gaussian=False,
+                 template_params=None, parallel=True):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -61,8 +62,6 @@ class DetectionPipeline:
             param_means: list of means for waveform parameters
             param_stds: list of standard deviations for waveform parameters
             mcmc_mask: list of booleans indicating which parameters to infer
-            priors: list of tuples of (lower, upper) bounds for each parameter
-                for individual events (amplitude + inferred parameters)
             dist_priors: list of tuples of (lower, upper) bounds for each
                 inferred parameter for the astrophysical distribution
                 in the format [mean_lims | std_lims] =
@@ -94,6 +93,7 @@ class DetectionPipeline:
         self.noise_quantum = trace['QuantumVacuum'].psd
         self.noise_classical = trace.psd - self.noise_quantum
         self.noise_total = trace.psd
+        self.log_noise_total = np.log(self.noise_total)
 
         # precompute calibration factor for photon probability
         self.ifo_calibration = self.compute_ifo_calibration()
@@ -120,10 +120,6 @@ class DetectionPipeline:
         self.ndim_p = np.sum(mcmc_mask)
         self.parallel = parallel
 
-        # priors for parameters of individual event
-        self.priors = priors
-        assert(self.priors is not None)
-
         # priors for parameters of astrophysical distribution
         self.dist_priors = dist_priors
         assert(self.dist_priors is not None)
@@ -149,6 +145,12 @@ class DetectionPipeline:
 
             # orthonormalize waveform templates
             self.templates = orth(self.templates)
+
+        # precompute some other useful matrices
+        self._event_prior_sign_mat = (
+            (1 - 2*np.eye(2))[np.newaxis,:,:].repeat(self.ndim_p, axis=0)
+        )
+
 
     ##############################################################
     ###################### WAVEFORM METHODS ######################
@@ -339,7 +341,7 @@ class DetectionPipeline:
             prob: (no. of realizations) x (no. of templates) matrix of probabilities
         Returns a matrix of the same shape with 0s and 1s.
         """
-        return np.array(self.rng.random(prob.shape) > prob, dtype=np.int)
+        return np.array(self.rng.random(prob.shape) > prob, dtype=int)
 
     ##############################################################
     ###################### MCMC METHODS ##########################
@@ -347,8 +349,8 @@ class DetectionPipeline:
 
     # default parameters for MCMC
     DEFAULT_WALKERS = 50
-    DEFAULT_STEPS_EVENT = 2000
-    DEFAULT_STEPS_DIST = 10000
+    DEFAULT_STEPS_EVENT = 1000
+    DEFAULT_STEPS_DIST = 2000
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -360,7 +362,7 @@ class DetectionPipeline:
 
     def log_prior(self, theta, priors):
         """
-        Compute the log-prior for the given parameters.
+        Compute the uniform log-prior for the given parameters.
             theta: array of parameters
             priors: list of tuples of (lower, upper) bounds for each parameter
         """
@@ -370,15 +372,56 @@ class DetectionPipeline:
     
     def log_prior_event(self, theta):
         """
-        Compute the log-prior for the given parameters of a single event.
+        Compute the log-prior for the given parameters of a single event, the
+        result of integrating a Gaussian over uniform priors on the mean
+        and standard deviation.
             theta: array of parameters
         """
-        return self.log_prior(theta, self.priors)
-    
+        # amplitude should always be positive
+        if theta[0] <= 0:
+            return -np.inf
+
+        # get priors for means and stds of event parameters;
+        # each numpy array has dimensions (no. of params, 2)
+        mu_p = np.array(self.dist_priors[:self.ndim_p])
+        sigma_p = np.array(self.dist_priors[self.ndim_p:])
+
+        # standard deviations of inferred parameters should always be positive
+        if np.any(sigma_p <= 0):
+            return -np.inf
+        
+        # make an effective meshgrid on the last dimension of mu_p, sigma_p
+        MU_P = mu_p[:,:,np.newaxis].repeat(2, axis=2)
+        SIGMA_P = sigma_p[:,np.newaxis,:].repeat(2, axis=1)
+
+        # broadcast theta to shape (no. of params, 2, 2)
+        t = theta[1:,np.newaxis,np.newaxis].repeat(2, 1).repeat(2, 2)
+
+        prior_terms = SIGMA_P * erf((t - MU_P) / np.sqrt(2) / SIGMA_P)
+
+        with np.errstate(invalid='ignore'):
+            expi_terms = (
+                (t - MU_P) * expi(-(t - MU_P)**2/2/SIGMA_P**2)
+                / np.sqrt(2*np.pi)
+            )
+
+        # only add the expi term when not infinite (in which case they
+        # cancel)
+        inds = (t!=MU_P)
+        prior_terms[inds] -= expi_terms[inds]
+        
+        # multiply by appropriate sign
+        prior_terms *= self._event_prior_sign_mat
+
+        prior = prior_terms.sum(axis=(1,2)).prod()
+
+        # use math.log for scalar performance
+        return -np.inf if prior <= 0 else math.log(prior)
+
     def log_prior_dist(self, theta):
         """
-        Compute the log-prior for the given parameters of the astrophysical
-        distribution.
+        Compute the uniform log-prior for the given parameters of the
+        astrophysical distribution.
             theta: array of parameters
         """
         return self.log_prior(theta, self.dist_priors)
@@ -401,10 +444,10 @@ class DetectionPipeline:
         # compute log likelihood for Gaussian noise
         return -0.5 * np.sum(
             np.abs(strain - model) ** 2 / self.noise_total
-            + np.log(self.noise_total)
+            + self.log_noise_total
         )
 
-    def log_likelihood_hd(self, theta, event_post, nint=100):
+    def log_likelihood_hd(self, theta, event_post, nint=400):
         """
         Log-likelihood function for hyper-parameter MCMC on homodyne detection,
         doing full integration based on event posteriors.
@@ -472,8 +515,8 @@ class DetectionPipeline:
         num_events = counts.shape[0]
 
         # compute log likelihood for binomial distribution
+        # excludes the constant term log(num_events choose counts)
         return np.sum(
-            # np.log(comb(num_events, counts)) +
             (num_events - counts) * np.log(avg_probs) +
             counts * np.log(1 - avg_probs)
         )
@@ -574,8 +617,10 @@ class DetectionPipeline:
         # unpack arguments
         wv, p0, nwalkers, ndim, nsteps = args
 
-        # use actual parameters as initial guesses with some scatter
-        pos = self._init_walkers(p0, nwalkers, ndim, self.priors)
+        # use actual parameters as initial guesses with some scatter;
+        # only restriction is that amplitude is positive
+        priors = [(0, np.inf)] + [(-np.inf, np.inf)]*self.ndim_p
+        pos = self._init_walkers(p0, nwalkers, ndim, priors)
 
         # initialize sampler
         sampler = emcee.EnsembleSampler(
@@ -654,14 +699,7 @@ class DetectionPipeline:
         )
 
         # run MCMC
-        try:
-            sampler.run_mcmc(pos, nsteps)
-        except ValueError:
-            print('---')
-            print(param_means)
-            print(param_stds)
-            print(pos[:5])
-            print('---')
+        sampler.run_mcmc(pos, nsteps)
 
         return sampler
 
@@ -743,7 +781,7 @@ class DetectionPipeline:
 
         return sampler
 
-    def count_mc(self, counts, nwalkers=None, nsteps=None, nint=10,
+    def count_mc(self, counts, nwalkers=None, nsteps=None, nint=100,
                  show_progress=True):
         """
         Perform MCMC to infer the parameters of the given waveforms, after they have
@@ -813,7 +851,7 @@ class DetectionPipeline:
         stds = np.zeros((N, len(self.param_means)))
 
         # flatten samples
-        event_posterior = Posterior(samplers)
+        event_posterior = Posterior(samplers, hyper=False)
 
         for i, s in enumerate(samplers):
             # take the mean and standard deviation of all samples
@@ -950,10 +988,6 @@ if __name__ == "__main__":
                             template_params=[
                                 [2400, 200, 0, 0],
                                 [2600, 200, 0, 0],
-                            ],
-                            priors=[
-                                (0, 1e-18), (500, 6000), (1, 500),
-                                (-2*np.pi, 2*np.pi), (-2, 2)
                             ],
                             dist_priors=[
                                 (0, 5000), (1, 60),
