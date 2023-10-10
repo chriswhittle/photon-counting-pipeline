@@ -361,9 +361,6 @@ class DetectionPipeline:
     DEFAULT_STEPS_EVENT = 1500
     DEFAULT_STEPS_DIST = 2000
 
-    DEFAULT_STEPS_EVENT = 200  # TODO:
-    DEFAULT_STEPS_DIST = 30  # TODO:
-
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
     WALKER_STD_MAX = 1e-1
@@ -954,8 +951,6 @@ class Posterior:
     # https://emcee.readthedocs.io/en/stable/tutorials/line/
     N_DISCARD = 500
     N_THIN = 50
-    N_DISCARD = 20#TODO:
-    N_THIN = 4#TODO:
 
     def __init__(self, samples, hyper=True, lean=False, calc_autocorr=False):
         """
@@ -1057,7 +1052,7 @@ class PipelineResults:
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(filename, 'w' + ('b' if binary else '')) as f:
-            save_fn(self, f)
+            save_fn(self, f, **kwargs)
 
     def save(self, filename):
         """
@@ -1089,7 +1084,7 @@ class PipelineResults:
             filename: path to pickle file
         """
         with open(filename, 'r') as f:
-            return pickle.load(f)
+            return json.load(f)
 
 
 if __name__ == "__main__":
