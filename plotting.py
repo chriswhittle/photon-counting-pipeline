@@ -164,13 +164,9 @@ class Plotter:
         else:
             posterior = self.results.hd_posterior.flat_samples
 
-        # evaluate the mean and stds for the posteriors of the inferred
-        # astrophysical parameters
-        posterior_means = np.array([p.mean(axis=0) for p in posterior])
-        posterior_stds = np.array([p.std(axis=0) for p in posterior])
-
-        ndim = posterior_means.shape[1]
-        event_counts = np.arange(1, posterior_means.shape[0]+1)
+        # get param dimension and number of events
+        ndim = posterior.means.shape[1]
+        event_counts = np.arange(1, posterior.means.shape[0]+1)
 
         # fetch the true astrophysical parameters
         true_params = np.concatenate(
@@ -183,10 +179,10 @@ class Plotter:
         fig, axs = plt.subplots(ndim, 1, sharex=True)
         plt.subplots_adjust(hspace=0)
         for i, ax in enumerate(axs):
-            ax.plot(event_counts, posterior_means[:, i])
+            ax.plot(event_counts, posterior.means[:, i])
             ax.fill_between(
-                event_counts, posterior_means[:, i] - posterior_stds[:, i],
-                posterior_means[:, i] + posterior_stds[:, i], alpha=0.1
+                event_counts, posterior.means[:, i] - posterior.stds[:, i],
+                posterior.means[:, i] + posterior.stds[:, i], alpha=0.1
             )
             ax.axhline(true_params[i], color="r", lw=1, alpha=1, ls='--')
         

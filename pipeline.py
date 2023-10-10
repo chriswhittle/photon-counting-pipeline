@@ -12,6 +12,7 @@ import gwinc
 import emcee
 import pickle
 from multiprocessing import Pool
+from pathlib import Path
 import yaml
 from tqdm import tqdm
 
@@ -155,6 +156,9 @@ class DetectionPipeline:
         self._event_prior_sign_mat = (
             (1 - 2*np.eye(2))[np.newaxis, :, :].repeat(self.ndim_p, axis=0)
         )
+
+        # whether to produce a lean results file
+        self.lean = lean
 
     ##############################################################
     ###################### WAVEFORM METHODS ######################
@@ -451,11 +455,13 @@ class DetectionPipeline:
             + self.log_noise_total
         )
 
-    def log_likelihood_hd(self, theta, event_post, nint=400):
+    def log_likelihood_hd(self, theta, event_post, wv_ind, nint=10000):
         """
         Log-likelihood function for hyper-parameter MCMC on homodyne detection,
         doing full integration based on event posteriors.
             theta: array of parameters
+            wv_ind: index of current event (up to which we should sample
+                when integrating over event posteriors)
             event_post: posterior distribution of event parameters, numpy array
                 of shape (no. of events, no. of MCMC samples, no. of params)
         """
@@ -463,14 +469,14 @@ class DetectionPipeline:
         means = theta[:self.ndim_p]
         stds = theta[self.ndim_p:]
 
-        # flatten first two dimensions of event_post
-        event_post = event_post.reshape(-1, event_post.shape[-1])
-        # randomly choose samples to integrate over
-        int_inds = self.rng.choice(event_post.shape[0], nint)
-        event_post = event_post[int_inds, :]
+        # randomly select events up to current index to sample
+        event_inds = self.rng.choice(wv_ind+1, nint)
+        # randomly select MCMC chain samples
+        sample_inds = self.rng.choice(event_post.shape[1], nint)
+        sampled_events = event_post[event_inds, sample_inds, 1:]
 
         return -0.5 * np.sum(
-            (event_post - means)**2 / stds**2
+            (sampled_events - means)**2 / stds**2
             + np.log(stds**2)
         )
 
@@ -496,7 +502,7 @@ class DetectionPipeline:
             (means - param_means)**2 / std_sum2 + np.log(std_sum2)
         )
 
-    def log_likelihood_pc(self, theta, counts, nint=100):
+    def log_likelihood_pc(self, theta, counts, nint):
         """
         Log-likelihood function for photon counting.
             theta: array of parameters
@@ -696,8 +702,8 @@ class DetectionPipeline:
             likelihood_fn = self.log_likelihood_hd
 
             # unpack arguments
-            events_posterior, pos, nwalkers, ndim, nsteps = args
-            likelihood_args = (events_posterior, )
+            events_posterior, wv_ind, pos, nwalkers, ndim, nsteps = args
+            likelihood_args = (events_posterior, wv_ind, )
 
         # initialize sampler
         sampler = emcee.EnsembleSampler(
@@ -754,11 +760,10 @@ class DetectionPipeline:
         else:
             # need to pass the full posterior samples if not Gaussian
             # (omit amplitude parameter)
-            events_posterior = np.array(event_data.flat_samples)
             subseq_args = [
-                (events_posterior[:wv_ind+1, :, 1:],
+                (event_data, wv_ind,
                  pos, nwalkers, ndim, nsteps)
-                for wv_ind in range(events_posterior.shape[0])
+                for wv_ind in range(event_data.shape[0])
             ]
 
         samplers = self._launch_mcmc_threads(
@@ -859,27 +864,26 @@ class DetectionPipeline:
         # do event-wise MCMC on the simulate strains
         samplers = self.strain_mc(waveforms_hd, sub_params)
 
-        # compute mean and standard deviation from walkers for each event
-        means = np.zeros((n, len(self.param_means)))
-        stds = np.zeros((n, len(self.param_means)))
+        # flatten samples (retain full samples even if lean)
+        event_posterior = Posterior(samplers, hyper=False, lean=False)
+        event_samples = np.array(event_posterior.flat_samples)
 
-        # flatten samples
-        event_posterior = Posterior(samplers, hyper=False)
+        # now can leanify event posteriors since we've grabbed the samples
+        if self.lean:
+            event_posterior.leanify()
 
-        for i, _ in enumerate(samplers):
-            # take the mean and standard deviation of all samples
-            # (excluding amplitude parameter)
-            means[i, :] = np.mean(event_posterior.flat_samples[i], axis=0)[1:]
-            stds[i, :] = np.std(event_posterior.flat_samples[i], axis=0)[1:]
+        # retrieve means and stds computed in Posterior object,
+        # excluding amplitude
+        means = event_posterior.means[:,1:]
+        stds = event_posterior.means[:,1:]
 
         # do MCMC on astrophysical population
         if self.hd_gaussian:
             hd_samplers = self.strain_dist_mc((means, stds))
         else:
-            hd_samplers = self.strain_dist_mc(event_posterior)
+            hd_samplers = self.strain_dist_mc(event_samples)
 
-        return (event_posterior, means, stds,
-                Posterior(hd_samplers))
+        return (event_posterior, Posterior(hd_samplers, lean=self.lean))
 
     def run_pc(self, raw_waveforms):
         """
@@ -904,7 +908,7 @@ class DetectionPipeline:
         # do photon counting MCMC
         pc_samplers = self.count_mc(photon_counts)
 
-        return (Posterior(pc_samplers), )
+        return (Posterior(pc_samplers, lean=self.lean), )
 
     def run(self, n, snr_sorted=False):
         """
@@ -947,19 +951,57 @@ class Posterior:
     N_DISCARD = 500
     N_THIN = 50
 
-    def __init__(self, samples, hyper=True):
-        self.samples = samples
-        # flatten chain samples
-        self.flat_samples = [s.get_chain(
-            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
-        ) for s in samples]
+    def __init__(self, samples, hyper=True, lean=False, calc_autocorr=False):
+        """
+        Create a Posterior object for storing MCMC chains and chain population
+        states.
 
-        # compute autocorrelation times
-        # self.autocorr_times = [s.get_autocorr_time() for s in samples]
-
+            samples: MCMC chains
+            hyper: whether these chains are for the astrophysical distribution
+                or individual events (used for plotting routines)
+            lean: whether to delete the chains and only save chain
+                statistics
+            calc_autocorr: whether to calculate chain autocorrelation (will
+                throw error if insufficient chain lengths)
+        """
         # whether this posterior is for the astrophysical hyper-parameters
         self.hyper = hyper
 
+        # flatten chain samples
+        self.samples = list(samples)
+        self.flat_samples = [s.get_chain(
+            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
+        ) for s in self.samples if s.iteration > self.N_DISCARD]
+
+        if len(self.flat_samples) == 0:
+            raise ValueError(f"Number of steps should be larger than N_DISCARD={self.N_DISCARD}")
+
+        # compute autocorrelation times
+        if calc_autocorr:
+            self.autocorr_times = [s.get_autocorr_time() for s in self.samples]
+
+        # compute mean and standard deviation from walkers for each event
+        stat_shape = (len(self.flat_samples), self.flat_samples[0].shape[1])
+        self.means = np.zeros(stat_shape)
+        self.stds = np.zeros(stat_shape)
+
+        # comute means/stds for each inferred parameter for each set of chains
+        for i in range(len(self.flat_samples)):
+            self.means[i, :] = np.mean(self.flat_samples[i], axis=0)
+            self.stds[i, :] = np.std(self.flat_samples[i], axis=0)
+
+        # remove samples for leaner save files
+        self.lean = lean
+        if lean:
+            self.leanify()
+
+    def leanify(self):
+        """
+        Make the posterior footprint lean by removing all the samples.
+        """
+        self.samples = None
+        self.flat_samples = None
+        self.lean = True
 
 @dataclass
 class PipelineResults:
@@ -973,8 +1015,6 @@ class PipelineResults:
 
     # individual event inferences from homodyne detection
     event_posterior: Posterior
-    event_means: np.ndarray
-    event_stds: np.ndarray
 
     # hyper-posterior from homodyne detection
     hd_posterior: Posterior
@@ -987,6 +1027,8 @@ class PipelineResults:
         Save PipelineResults object to a pickle file.
             filename: path to pickle file
         """
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(filename, 'wb') as f:
             pickle.dump(self, f)
 
