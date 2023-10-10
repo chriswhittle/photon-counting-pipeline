@@ -2,8 +2,10 @@
 event_count: 20
 parallel: True
 
-output_file: results.pkl
+output_file: results.json
 lean: True
+
+snr_sorted: False
 
 # detector (gwinc label)
 detector: CE1
