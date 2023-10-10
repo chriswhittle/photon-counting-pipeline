@@ -1,0 +1,42 @@
+# pipeline run parameters
+event_count: 20
+parallel: True
+
+output_file: results.pkl
+lean: True
+
+# detector (gwinc label)
+detector: CE1
+
+# frequency range
+f_low: 2300
+f_high: 2700
+bin_width: 2
+
+# astrophysical parameter distribution
+param_means:
+  - 2400
+  - 30
+  - 0
+  - 0
+param_stds:
+  - 50
+  - 10
+  - 1
+  - 0.3
+
+# priors for inference of astrophysical distribution
+dist_priors:
+  - [0, 5000]
+  - [1, 60]
+  - [-2*pi, 2*pi]
+  - [0, 1]
+  - [0.1, 1000]
+  - [0.1, 100]
+  - [0.1, 2*pi]
+  - [0.1, 1]
+
+# photon counting template parameters
+template_params:
+  - [2400, 200, 0, 0]
+  - [2600, 200, 0, 0]

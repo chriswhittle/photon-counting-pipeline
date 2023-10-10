@@ -310,3 +310,6 @@ __pycache__/
 # Python notebooks for development
 *.ipynb
 *.ipynb_checkpoints
+
+# configs and results
+runs/
