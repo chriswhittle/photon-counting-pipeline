@@ -1049,7 +1049,7 @@ if __name__ == "__main__":
 
         p = DetectionPipeline(**config)
 
-        results = p.run(config['event_count'])
+        results = p.run(config['event_count'], snr_sorted=config['snr_sorted'])
 
         results.save(config['output_file'])
     else:
