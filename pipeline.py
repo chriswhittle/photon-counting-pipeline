@@ -11,6 +11,7 @@ from scipy.linalg import orth
 import gwinc
 import emcee
 import pickle
+import json
 from multiprocessing import Pool
 from pathlib import Path
 import yaml
@@ -1003,6 +1004,21 @@ class Posterior:
         self.flat_samples = None
         self.lean = True
 
+def json_default(o):
+    """
+    Serializing types not natively supported by JSON.
+
+        o: object that JSON failed to serialize
+    """
+    if isinstance(o, np.int64): return int(o)
+    if isinstance(o, np.float64): return float(o)
+    if isinstance(o, np.ndarray): return o.tolist()
+    if isinstance(o, DetectionPipeline) or isinstance(o, Posterior):
+        return o.__dict__
+
+    # do not save if cannot be serialized
+    return None
+
 @dataclass
 class PipelineResults:
     """
@@ -1022,15 +1038,33 @@ class PipelineResults:
     # hyper-posterior from photon counting
     pc_posterior: Posterior
 
+    def _save_generic(self, filename, save_fn, binary, **kwargs):
+        """
+        Save PipelineResults object to a file with a generic serialization
+        function.
+            filename: path to file
+            save_fn: function to use for saving
+            binary: whether to save in binary format
+            kwargs: additional kwargs for save_fn
+        """
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(filename, 'w' + ('b' if binary else '')) as f:
+            save_fn(self, f)
+
     def save(self, filename):
         """
         Save PipelineResults object to a pickle file.
             filename: path to pickle file
         """
-        path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(filename, 'wb') as f:
-            pickle.dump(self, f)
+        self._save_generic(filename, pickle.dump, True)
+
+    def save_json(self, filename):
+        """
+        Save PipelineResults object to a JSON file.
+            filename: path to JSON file
+        """
+        self._save_generic(filename, json.dump, False, default=json_default)
 
     @staticmethod
     def load(filename):
@@ -1039,6 +1073,15 @@ class PipelineResults:
             filename: path to pickle file
         """
         with open(filename, 'rb') as f:
+            return pickle.load(f)
+
+    @staticmethod
+    def load_json(filename):
+        """
+        Load contents from a JSON file into a PipelineResults object.
+            filename: path to pickle file
+        """
+        with open(filename, 'r') as f:
             return pickle.load(f)
 
 
@@ -1051,6 +1094,6 @@ if __name__ == "__main__":
 
         results = p.run(config['event_count'], snr_sorted=config['snr_sorted'])
 
-        results.save(config['output_file'])
+        results.save_json(config['output_file'])
     else:
         print("Usage: python pipeline.py config.yaml")
