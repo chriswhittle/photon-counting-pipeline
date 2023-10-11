@@ -931,6 +931,7 @@ class DetectionPipeline:
         if snr_sorted:
             sorted_inds = np.argsort(snrs)[::-1]
 
+            snrs = snrs[sorted_inds]
             waveforms = waveforms[:, sorted_inds]
             params = params[:, sorted_inds]
 

@@ -152,12 +152,14 @@ class Plotter:
             flat_samples, truths=true_params if posterior.hyper else None
         )
 
-    def astro_sequence(self, pc=False):
+    def astro_sequence(self, pc=False, x_snr=False):
         """
         Plot the inferred (mean and uncertainty) astrophysical parameters
         (mean and standard deviation) as a function of event count.
 
             pc: whether to use the posteriors computed using photon counting
+            x_snr: whether to plot the SNR instead of the event count on the
+                x-axis
         """
         if pc:
             posterior = self.results.pc_posterior
@@ -170,7 +172,10 @@ class Plotter:
 
         # get param dimension and number of events
         ndim = posterior.means.shape[1]
-        event_counts = np.arange(1, posterior.means.shape[0]+1)
+        if x_snr:
+            xs = self.results.event_snrs
+        else:
+            xs = np.arange(1, posterior.means.shape[0]+1)
 
         # fetch the true astrophysical parameters
         true_params = np.concatenate(
@@ -183,11 +188,15 @@ class Plotter:
         fig, axs = plt.subplots(ndim, 1, sharex=True)
         plt.subplots_adjust(hspace=0)
         for i, ax in enumerate(axs):
-            ax.plot(event_counts, posterior.means[:, i])
+            ax.plot(xs, posterior.means[:, i])
             ax.fill_between(
-                event_counts, posterior.means[:, i] - posterior.stds[:, i],
+                xs, posterior.means[:, i] - posterior.stds[:, i],
                 posterior.means[:, i] + posterior.stds[:, i], alpha=0.1
             )
             ax.axhline(true_params[i], color="r", lw=1, alpha=1, ls='--')
-        
-        ax.set_xlabel('Event count')
+
+        if x_snr:
+            ax.set_xlabel('SNR')
+            ax.invert_xaxis()
+        else:
+            ax.set_xlabel('Event count')
