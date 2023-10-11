@@ -160,9 +160,13 @@ class Plotter:
             pc: whether to use the posteriors computed using photon counting
         """
         if pc:
-            posterior = self.results.pc_posterior.flat_samples
+            posterior = self.results.pc_posterior
         else:
-            posterior = self.results.hd_posterior.flat_samples
+            posterior = self.results.hd_posterior
+        
+        # ensure numpy array
+        posterior.means = np.array(posterior.means)
+        posterior.stds = np.array(posterior.stds)
 
         # get param dimension and number of events
         ndim = posterior.means.shape[1]

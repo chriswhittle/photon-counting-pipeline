@@ -1110,6 +1110,7 @@ class PipelineResults:
                         new_posterior = Posterior()
                         for key, value in results[attr_name].items():
                             setattr(new_posterior, key, value)
+                        results[attr_name] = new_posterior
 
                     # set values in pipeline object
                     if attr_class == DetectionPipeline:
