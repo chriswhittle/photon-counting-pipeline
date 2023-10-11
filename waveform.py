@@ -27,3 +27,7 @@ def lorentzian(f, f0, bw, phi, t0):
     wavelet *= exp(-2j * np.pi * f  * (t0 + 1/(2*bin_width)))
 
     return wavelet
+
+WAVEFORM_FUNCTIONS = {
+    'lorentzian': lorentzian
+}

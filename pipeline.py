@@ -1,6 +1,7 @@
 import sys
 from dataclasses import dataclass
-from inspect import signature
+from inspect import signature, getmembers
+import types
 from warnings import warn
 
 import math
@@ -105,14 +106,17 @@ class DetectionPipeline:
         self.ifo_calibration = self.compute_ifo_calibration()
 
         # function used to compute (unit) waveform
-        self.waveform_func = waveform_func
+        if isinstance(waveform_func, str):
+            self.waveform_func = waveform.WAVEFORM_FUNCTIONS[waveform_func]
+        else:
+            self.waveform_func = waveform_func
 
         # SNR cutoff for post-merger waveform; used for building event
         # distribution on which we do MCMC
         self.snr_cutoff = snr_cutoff
 
         # instantiate parameter means and variances and MCMC mask and priors
-        param_count = len(signature(waveform_func).parameters) - 1
+        param_count = len(signature(self.waveform_func).parameters) - 1
         if param_means is None:
             param_means = [1]*param_count
         if param_stds is None:
@@ -952,7 +956,7 @@ class Posterior:
     N_DISCARD = 500
     N_THIN = 50
 
-    def __init__(self, samples, hyper=True, lean=False, calc_autocorr=False):
+    def __init__(self, samples=None, hyper=True, lean=False, calc_autocorr=False):
         """
         Create a Posterior object for storing MCMC chains and chain population
         states.
@@ -965,36 +969,37 @@ class Posterior:
             calc_autocorr: whether to calculate chain autocorrelation (will
                 throw error if insufficient chain lengths)
         """
-        # whether this posterior is for the astrophysical hyper-parameters
-        self.hyper = hyper
+        if samples is not None:
+            # whether this posterior is for the astrophysical hyper-parameters
+            self.hyper = hyper
 
-        # flatten chain samples
-        self.samples = list(samples)
-        self.flat_samples = [s.get_chain(
-            discard=self.N_DISCARD, thin=self.N_THIN, flat=True
-        ) for s in self.samples if s.iteration > self.N_DISCARD]
+            # flatten chain samples
+            self.samples = list(samples)
+            self.flat_samples = [s.get_chain(
+                discard=self.N_DISCARD, thin=self.N_THIN, flat=True
+            ) for s in self.samples if s.iteration > self.N_DISCARD]
 
-        if len(self.flat_samples) == 0:
-            raise ValueError(f"Number of steps should be larger than N_DISCARD={self.N_DISCARD}")
+            if len(self.flat_samples) == 0:
+                raise ValueError(f"Number of steps should be larger than N_DISCARD={self.N_DISCARD}")
 
-        # compute autocorrelation times
-        if calc_autocorr:
-            self.autocorr_times = [s.get_autocorr_time() for s in self.samples]
+            # compute autocorrelation times
+            if calc_autocorr:
+                self.autocorr_times = [s.get_autocorr_time() for s in self.samples]
 
-        # compute mean and standard deviation from walkers for each event
-        stat_shape = (len(self.flat_samples), self.flat_samples[0].shape[1])
-        self.means = np.zeros(stat_shape)
-        self.stds = np.zeros(stat_shape)
+            # compute mean and standard deviation from walkers for each event
+            stat_shape = (len(self.flat_samples), self.flat_samples[0].shape[1])
+            self.means = np.zeros(stat_shape)
+            self.stds = np.zeros(stat_shape)
 
-        # comute means/stds for each inferred parameter for each set of chains
-        for i in range(len(self.flat_samples)):
-            self.means[i, :] = np.mean(self.flat_samples[i], axis=0)
-            self.stds[i, :] = np.std(self.flat_samples[i], axis=0)
+            # comute means/stds for each inferred parameter for each set of chains
+            for i in range(len(self.flat_samples)):
+                self.means[i, :] = np.mean(self.flat_samples[i], axis=0)
+                self.stds[i, :] = np.std(self.flat_samples[i], axis=0)
 
-        # remove samples for leaner save files
-        self.lean = lean
-        if lean:
-            self.leanify()
+            # remove samples for leaner save files
+            self.lean = lean
+            if lean:
+                self.leanify()
 
     def leanify(self):
         """
@@ -1010,13 +1015,21 @@ def json_default(o):
 
         o: object that JSON failed to serialize
     """
+    # convert numpy objects
     if isinstance(o, np.int64): return int(o)
     if isinstance(o, np.float64): return float(o)
     if isinstance(o, np.ndarray): return o.tolist()
-    if any([isinstance(o, c) for c in [
-        DetectionPipeline, Posterior, PipelineResults
-    ]]):
+
+    # convert pipeline class instances
+    if isinstance(o, (DetectionPipeline, Posterior, PipelineResults)):
         return o.__dict__
+
+    # convert gwinc IFOs to strings
+    if isinstance(o, gwinc.nb.Budget):
+        return o.__class__.__name__
+
+    if isinstance(o, types.FunctionType):
+        return o.__name__
 
     # do not save if cannot be serialized
     return None
@@ -1084,7 +1097,27 @@ class PipelineResults:
             filename: path to pickle file
         """
         with open(filename, 'r') as f:
-            return json.load(f)
+            results = json.load(f)
+
+        # build objects from dictionaries loaded via JSON
+        for m in getmembers(PipelineResults):
+            if m[0] == '__dataclass_fields__':
+                for attr_name, attr in m[1].items():
+                    attr_class = attr.type
+
+                    # set values in posterior objects
+                    if attr_class == Posterior:
+                        new_posterior = Posterior()
+                        for key, value in results[attr_name].items():
+                            setattr(new_posterior, key, value)
+
+                    # set values in pipeline object
+                    if attr_class == DetectionPipeline:
+                        results[attr_name] = DetectionPipeline(
+                            **results[attr_name]
+                        )
+        
+        return PipelineResults(**results)
 
 
 if __name__ == "__main__":

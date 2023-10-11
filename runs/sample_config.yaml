@@ -16,6 +16,8 @@ f_high: 2700
 bin_width: 2
 
 # astrophysical parameter distribution
+waveform_func: lorentzian
+
 param_means:
   - 2400
   - 30
