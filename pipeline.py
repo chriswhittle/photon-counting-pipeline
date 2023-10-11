@@ -85,7 +85,9 @@ class DetectionPipeline:
         self.rng = np.random.default_rng(0)
 
         # generate frequency bins
-        self.bw = bin_width
+        self.bw, self.f_low, self.f_high, self.f_sample = (
+            bin_width, f_low, f_high, f_sample
+        )
         self.f = frequency_bins(f_sample, bin_width, f_low, f_high)
 
         # load detector budget
