@@ -45,7 +45,7 @@ class DetectionPipeline:
 
     def __init__(self, f_sample=16384, bin_width=1, f_low=None, f_high=None,
                  detector='CE1', waveform_func=waveform.lorentzian,
-                 snr_cutoff=0.2, param_means=None, param_stds=None,
+                 snr_cutoff=1, param_means=None, param_stds=None,
                  mcmc_mask=None, dist_priors=None, hd_gaussian=False,
                  template_params=None, parallel=True, lean=True, **kwargs):
         """
@@ -62,9 +62,9 @@ class DetectionPipeline:
             waveform_func: function used to generate post-merger waveform;
                 should have signature waveform_func(f, *args) where f is
                 a broadcast frequency array and args are the waveform parameters
-            snr_cutoff: SNR threshold for detection of an event; post-merger
-                waveforms will be drawn from a distribution that uses this as a
-                minimum (should be ~0.1 times the CBC waveform SNR)
+            snr_cutoff: SNR threshold for detection of an event (relative to
+                classical noise); post-merger waveforms will be drawn from a
+                distribution that uses this as a minimum (default is 1)
             param_means: list of means for waveform parameters
             param_stds: list of standard deviations for waveform parameters
             mcmc_mask: list of booleans indicating which parameters to infer
@@ -199,18 +199,24 @@ class DetectionPipeline:
         """
         return self.bw * np.sum(a * np.conj(b), axis=0)
 
-    def compute_snr(self, wv):
+    def compute_snr(self, wv, noise_psd=None):
         """
         Compute the SNR of the given waveform:
         SNR = sqrt(2 * integral(|waveform|^2 / noise))
+            wv: waveform (frequency, event)
+            noise_psd: noise PSD to use for SNR computation, if None defaults
+                to IFO noise_total
         """
+        if noise_psd is None:
+            noise_psd = self.noise_total
+
         # duplicate noise across a new axis for broadcasting
         # if params is 2-dimensional
         wv = np.array(wv)
         if len(wv.shape) == 2:
-            noise = self.noise_total[:, np.newaxis].repeat(wv.shape[1], axis=1)
+            noise = noise_psd[:, np.newaxis].repeat(wv.shape[1], axis=1)
         else:
-            noise = self.noise_total
+            noise = noise_psd
         return np.sqrt(2 *
                        np.real(self.inner_product(wv / noise, wv))
                        )
@@ -248,7 +254,7 @@ class DetectionPipeline:
 
         # compute SNR of waveforms to renormalize (since waveforms of unit
         # normalization will have varying SNRs)
-        unit_snrs = self.compute_snr(waveforms)
+        unit_snrs = self.compute_snr(waveforms, self.noise_classical)
         amplitudes = snr_samples / unit_snrs
         waveforms *= amplitudes
 
@@ -929,7 +935,7 @@ class DetectionPipeline:
         params, waveforms = self.sample_events(n, True)
 
         # sort events by distance and perform hyper-MCMC on sorted events
-        snrs = self.compute_snr(waveforms)
+        snrs = self.compute_snr(waveforms, self.noise_classical)
         if snr_sorted:
             sorted_inds = np.argsort(snrs)[::-1]
 
@@ -1126,13 +1132,15 @@ class PipelineResults:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        # load config file given as first command-line argument
         with open(sys.argv[1], 'r') as file:
             config = yaml.safe_load(file)
 
+        # initialize pipeline object
         p = DetectionPipeline(**config)
 
+        # run full pipeline and save output to JSON file
         results = p.run(config['event_count'], snr_sorted=config['snr_sorted'])
-
         results.save_json(config['output_file'])
     else:
         print("Usage: python pipeline.py config.yaml")
