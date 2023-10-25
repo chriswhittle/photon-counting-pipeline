@@ -65,9 +65,13 @@ class DetectionPipeline:
             snr_cutoff: SNR threshold for detection of an event (relative to
                 classical noise); post-merger waveforms will be drawn from a
                 distribution that uses this as a minimum (default is 1)
-            param_means: list of means for waveform parameters
-            param_stds: list of standard deviations for waveform parameters
-            mcmc_mask: list of booleans indicating which parameters to infer
+            param_means: list of means for waveform parameters; length should be
+                equal to 1 + number of arguments of waveform_func (first is
+                reserved for an amplitude parameter)
+            param_stds: list of standard deviations for waveform parameters;
+                length same as param_means
+            mcmc_mask: list of booleans indicating which parameters to infer;
+                length same as param_means
             dist_priors: list of tuples of (lower, upper) bounds for each
                 inferred parameter for the astrophysical distribution
                 in the format [mean_lims | std_lims] =
@@ -77,7 +81,8 @@ class DetectionPipeline:
                 (only appropriate for events above threshold that do not have
                 uniform posteriors)
             template_params: list of parameters for each template waveform for
-                photon counting detection
+                photon counting detection; length should equal signature of
+                waveform_func (i.e. no amplitude parameter)
             parallel: whether to use Multiprocessing parallelization
             lean: set to True to discard sample chains before saving
         """
@@ -237,30 +242,41 @@ class DetectionPipeline:
         shape (no. of parameters, N).
         """
         # use true distribution values for this pipeline if none given
+        # (otherwise use the provided means and stds)
         if means is None:
             means = self.param_means
         if stds is None:
             stds = self.param_stds
 
-        # SNR ~ amplitude ~ distance
+        # SNR ~ amplitude ~ 1/distance
         # distance CDF = (distance/distance_max)^3
-        # SNR CDF = 1 - (SNR_min/SNR)^3
-        # SNR = SNR_min / (1 - random)*(1/3)
-        snr_samples = self.snr_cutoff / (1 - self.rng.random(N))**(1/3)
+        # where distance_max corresponds to the provided SNR cutoff;
+        # SNR = SNR_cutoff * (distance_max/distance)
+        # use dimensionless distance i.e. set distance_max = 1
+        distance_samples = (self.rng.random(N))**(1/3)
+        snr_samples = self.snr_cutoff / distance_samples
 
-        # draw parameters from Gaussian distributions
+        # draw parameters from Gaussian distributions (including amplitude
+        # as the first parameter)
         param_samples = self.draw_params(N, means, stds)
-        waveforms = self.waveform(param_samples)
+        # compute waveforms using the sampled parameter values; exclude
+        # amplitude parameter
+        waveforms = self.waveform(param_samples[1:,:])
 
         # compute SNR of waveforms to renormalize (since waveforms of unit
         # normalization will have varying SNRs)
         unit_snrs = self.compute_snr(waveforms, self.noise_classical)
         amplitudes = snr_samples / unit_snrs
+        # modify waveforms to take into account extrinsic ampplitude modifier
+        # (i.e. distance from source)
         waveforms *= amplitudes
+
+        # finally, multiply again by the intrinsic amplitude modifier
+        waveforms *= param_samples[0,:]
 
         # return waveforms and parameters if requested
         if return_params:
-            combined_params = np.vstack((amplitudes, param_samples))
+            combined_params = np.vstack((distance_samples, param_samples))
             return combined_params, waveforms
         else:
             return waveforms
@@ -388,9 +404,12 @@ class DetectionPipeline:
         and standard deviation.
             theta: array of parameters
         """
-        # amplitude should always be positive
-        if theta[0] <= 0:
+        # distance should always be between 0 and max distance (= 1)
+        if not 0 < theta[0] < 1:
             return -np.inf
+        # if in valid range, f(d) = 3 * (distance / max distance)^2
+        # (math.log for better scalar performance)
+        distance_prior = 2 * math.log(theta[0])
 
         # get priors for means and stds of event parameters;
         # each numpy array has dimensions (no. of params, 2)
@@ -426,8 +445,11 @@ class DetectionPipeline:
 
         prior = prior_terms.sum(axis=(1, 2)).prod()
 
+        # if prior very small
+        if prior <= 0:
+            return -np.inf
         # use math.log for scalar performance
-        return -np.inf if prior <= 0 else math.log(prior)
+        return math.log(prior) + distance_prior
 
     def log_prior(self, theta, priors):
         """
@@ -459,8 +481,12 @@ class DetectionPipeline:
         params = self.param_means.copy()
         params[self.mcmc_mask] = theta[1:]
 
-        # compute waveform and scale by amplitude
-        model = self.waveform(params) * theta[0]
+        # compute waveform using all parameters except the amplitude
+        model = self.waveform(params[1:]) * theta[0]
+        # modify the amplitude of the computed waveform by multiplying by the
+        # intrinsic amplitude and dividing by the distance (in units of max
+        # distance)
+        model *= theta[1] / theta[0]
 
         # compute log likelihood for Gaussian noise
         return -0.5 * np.sum(
