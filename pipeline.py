@@ -45,9 +45,10 @@ class DetectionPipeline:
 
     def __init__(self, f_sample=16384, bin_width=1, f_low=None, f_high=None,
                  detector='CE1', waveform_func=waveform.lorentzian,
-                 snr_cutoff=1, param_means=None, param_stds=None,
-                 mcmc_mask=None, dist_priors=None, hd_gaussian=False,
-                 template_params=None, parallel=True, lean=True, **kwargs):
+                 snr_cutoff=1, distance_uncertainty=0.03, distance_prior=True,
+                 param_means=None, param_stds=None, mcmc_mask=None,
+                 dist_priors=None, hd_gaussian=False, template_params=None,
+                 parallel=True, lean=True, **kwargs):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -65,6 +66,13 @@ class DetectionPipeline:
             snr_cutoff: SNR threshold for detection of an event (relative to
                 classical noise); post-merger waveforms will be drawn from a
                 distribution that uses this as a minimum (default is 1)
+            distance_uncertainty: relative uncertainty in the distance
+                inference from the coalescence signal, used as the prior
+                for the post-merger signal inference (requires distance_prior
+                to be True)
+            distance_prior: whether to use the true distance as a prior
+                for inference on a post-merger event (e.g. having inferred
+                it from the coalescence)
             param_means: list of means for waveform parameters; length should be
                 equal to 1 + number of arguments of waveform_func (first is
                 reserved for an amplitude parameter)
@@ -121,6 +129,12 @@ class DetectionPipeline:
         # SNR cutoff for post-merger waveform; used for building event
         # distribution on which we do MCMC
         self.snr_cutoff = snr_cutoff
+
+        # whether to use the true distance for the prior in event inference
+        self.distance_prior = distance_prior
+        # relative distance uncertainty; used for the distance prior
+        # on event parameter inference
+        self.distance_uncertainty = distance_uncertainty
 
         # instantiate parameter means and variances and MCMC mask and priors
         param_count = len(signature(self.waveform_func).parameters) - 1
@@ -397,19 +411,32 @@ class DetectionPipeline:
     # prior, likelihood, probability functions
     # these need to be top-level to be pickle-able by Multiprocessing
 
-    def log_prior_event(self, theta):
+    def log_prior_event(self, theta, distance):
         """
         Compute the log-prior for the given parameters of a single event, the
         result of integrating a Gaussian over uniform priors on the mean
         and standard deviation.
             theta: array of parameters
+            distance: true distance of event
         """
-        # distance should always be between 0 and max distance (= 1)
-        if not 0 < theta[0] < 1:
+        # distance should always be greater than 0
+        # (need not be less than 1 if true distance is given)
+        if theta[0] < 0:
             return -np.inf
-        # if in valid range, f(d) = 3 * (distance / max distance)^2
-        # (math.log for better scalar performance)
-        distance_prior = 2 * math.log(theta[0])
+
+        # if we have knowledge of the event distance from the coalescence,
+        # use Gaussian uncertainty (math.log for better scalar performance)
+        if self.distance_prior:
+            distance_std = distance * self.distance_uncertainty
+            distance_prior = -math.log(distance_std)
+            distance_prior -= (theta[0] - distance)/2/distance_std**2
+        # if we have no knowledge of the distance,
+        # f(d) = 3 * (distance / max distance)^2
+        else:
+            # should enforce maximum distance if we have no other distance info
+            if theta[0] > 1:
+                return -np.inf
+            distance_prior = 2 * math.log(theta[0])
 
         # get priors for means and stds of event parameters;
         # each numpy array has dimensions (no. of params, 2)
@@ -575,7 +602,8 @@ class DetectionPipeline:
             counts * np.log(1 - avg_probs)
         )
 
-    def log_probability(self, theta, prior_fn, likelihood_fn, *args):
+    def log_probability(self, theta, prior_fn, likelihood_fn,
+                        prior_args=[], likelihood_args=[]):
         """
         Compute the overall log-probability = log-prior + log-likelihood for the
         given parameters, likelihood function (and additional arguments).
@@ -583,12 +611,13 @@ class DetectionPipeline:
             theta: array of parameters
             prior_fn: function for computing prior
             likelihood_fn: function for computing likelihood
-            args: additional arguments for likelihood function
+            prior_args: additional arguments for prior function
+            likelihood_args: additional arguments for likelihood
         """
-        lp = prior_fn(theta)
+        lp = prior_fn(theta, *prior_args)
         if not np.isfinite(lp):
             return -np.inf
-        return lp + likelihood_fn(theta, *args)
+        return lp + likelihood_fn(theta, *likelihood_args)
 
     # MCMC functions
 
@@ -671,15 +700,29 @@ class DetectionPipeline:
         # unpack arguments
         wv, p0, nwalkers, ndim, nsteps = args
 
-        # use actual parameters as initial guesses with some scatter;
-        # only restriction is that amplitude is positive
-        priors = [(0, np.inf)] + [(-np.inf, np.inf)]*self.ndim_p
+        # set up initial walkers:
+        # for distance, use points near true distance if given distance info
+        if self.distance_prior:
+            priors = [
+                (p0[0]*(1 - self.distance_uncertainty), 
+                 p0[0]*(1 + self.distance_uncertainty))
+            ]
+        # otherwise pick any distance up to maximum (1 in these units)
+        else:
+            priors = [(0, 1)]
+        # for remaining parameters, use true values as initial guesses
+        # with some scatter
+        priors = priors + [(-np.inf, np.inf)]*self.ndim_p
         pos = self._init_walkers(p0, nwalkers, ndim, priors)
 
-        # initialize sampler
+        # initialize sampler using arguments: event-specific prior function,
+        # event-specific likelihood function, true distances and strain
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, self.log_probability,
-            args=(self.log_prior_event, self.log_likelihood_event, wv,)
+            args=(
+                self.log_prior_event, self.log_likelihood_event,
+                [p0[0]], [wv]
+            )
         )
 
         # run MCMC
@@ -694,8 +737,8 @@ class DetectionPipeline:
             f: array of frequencies
             strain: (no. of frequencies, no. of realizations) array of strains
             noise_spectrum: noise power spectral density
-            p0: initial guesses for the walkers, use e.g. actual parameters used to
-                generate the strains
+            p0: initial guesses for the walkers, use e.g. actual parameters used
+                to generate the strains
             waveform_fn: function that takes parameters and returns a waveform
             nwalkers: number of walkers to use in MCMC
             nsteps: number of steps to take in MCMC
@@ -748,7 +791,7 @@ class DetectionPipeline:
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, self.log_probability,
             args=(
-                self.log_prior_dist, likelihood_fn, *likelihood_args
+                self.log_prior_dist, likelihood_fn, [], likelihood_args
             )
         )
 
@@ -826,7 +869,7 @@ class DetectionPipeline:
             nwalkers, ndim, self.log_probability,
             args=(
                 self.log_prior_dist, self.log_likelihood_pc,
-                counts, nint,
+                [], (counts, nint)
             )
         )
 
@@ -900,7 +943,7 @@ class DetectionPipeline:
         # pick out true values of parameters to be inferred (including amplitude)
         sub_params = params[[True] + self.mcmc_mask, :]
 
-        # do event-wise MCMC on the simulate strains
+        # do event-wise MCMC on the simulated strains
         samplers = self.strain_mc(waveforms_hd, sub_params)
 
         # flatten samples (retain full samples even if lean)
@@ -924,13 +967,15 @@ class DetectionPipeline:
 
         return (event_posterior, Posterior(hd_samplers, lean=self.lean))
 
-    def run_pc(self, raw_waveforms):
+    def run_pc(self, raw_waveforms, params):
         """
         Given the simulated events (without noise), add noise and perform
         MCMC to get the astrophysical hyper-posteriors.
 
             raw_waveforms: np arrays of shape
             (no. of frequencies, no. of events)
+            params: np arrays of shape (no. of parameters, no. of events)
+            with the true parameters used to generate the waveforms
         """
         # number of events
         n = raw_waveforms.shape[1]
@@ -961,11 +1006,11 @@ class DetectionPipeline:
         params, waveforms = self.sample_events(n, True)
 
         # sort events by distance and perform hyper-MCMC on sorted events
-        snrs = self.compute_snr(waveforms, self.noise_classical)
+        distances = params[0,:]
         if snr_sorted:
-            sorted_inds = np.argsort(snrs)[::-1]
+            sorted_inds = np.argsort(distances)
 
-            snrs = snrs[sorted_inds]
+            distances = distances[sorted_inds]
             waveforms = waveforms[:, sorted_inds]
             params = params[:, sorted_inds]
 
@@ -973,10 +1018,10 @@ class DetectionPipeline:
         hd_results = self.run_hd(waveforms, params)
 
         # photon counting MCMC
-        pc_results = self.run_pc(waveforms)
+        pc_results = self.run_pc(waveforms, params)
 
         # return computed data
-        return PipelineResults(self, snrs, *hd_results, *pc_results)
+        return PipelineResults(self, distances, *hd_results, *pc_results)
 
 
 class Posterior:
