@@ -1094,16 +1094,19 @@ class PipelineResults:
     """
     pipeline: DetectionPipeline
 
-    # list of event SNRs
-    event_snrs: np.ndarray
+    # list of event distances
+    event_distances: np.ndarray
 
     # individual event inferences from homodyne detection
-    event_posterior: Posterior
+    hd_event_posterior: Posterior
 
-    # hyper-posterior from homodyne detection
+    # individual event inferences from homodyne detection
+    pc_event_posterior: Posterior
+
+    # distribution posterior from homodyne detection
     hd_posterior: Posterior
 
-    # hyper-posterior from photon counting
+    # distribution posterior from photon counting
     pc_posterior: Posterior
 
     def _save_generic(self, filename, save_fn, binary, **kwargs):
