@@ -556,6 +556,10 @@ class DetectionPipeline:
         int_probs = self.no_photon_prob(int_wv)
         avg_probs = np.mean(int_probs, axis=0)
 
+        # if we saw counts where this waveform should not produce any,
+        # it is impossible (and vice versa)
+        if any(counts & (avg_probs == 0)) or any((~counts) & (avg_probs == 1)):
+            return -np.inf
         # compute log likelihood for binomial distribution
         # excludes the constant term log(num_events choose counts)
         return np.sum(
