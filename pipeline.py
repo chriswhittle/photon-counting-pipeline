@@ -48,7 +48,7 @@ class DetectionPipeline:
                  snr_cutoff=1, distance_uncertainty=0.03, distance_prior=True,
                  param_means=None, param_stds=None, mcmc_mask=None,
                  dist_priors=None, dist_gaussian=False, template_params=None,
-                 parallel=True, lean=True, **kwargs):
+                 parallel=True, checkpoints=4, **kwargs):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -92,7 +92,7 @@ class DetectionPipeline:
                 photon counting detection; length should equal signature of
                 waveform_func (i.e. no amplitude parameter)
             parallel: whether to use Multiprocessing parallelization
-            lean: set to True to discard sample chains before saving
+            checkpoints: how often to save posteriors (1 = save all posteriors)
         """
         # seeded random number generator to use throughout
         self.rng = np.random.default_rng(0)
@@ -183,8 +183,8 @@ class DetectionPipeline:
             (1 - 2*np.eye(2))[np.newaxis, :, :].repeat(self.ndim_p, axis=0)
         )
 
-        # whether to produce a lean results file
-        self.lean = lean
+        # how frequently to save posteriors
+        self.checkpoints = checkpoints
 
     ##############################################################
     ###################### WAVEFORM METHODS ######################
@@ -562,9 +562,9 @@ class DetectionPipeline:
             return -np.inf
         # compute log likelihood for binomial distribution
         # excludes the constant term log(num_events choose counts)
+        all_probs = np.vstack((avg_probs, 1-avg_probs))
         return np.sum(
-            (1 - counts) * np.log(avg_probs) +
-            counts * np.log(1 - avg_probs)
+            all_probs[counts, np.arange(all_probs.shape[1])]
         )
 
     def log_likelihood_dist(self, theta, event_post, wv_ind, nint=10000):
@@ -902,13 +902,12 @@ class DetectionPipeline:
         # samplers
         samplers = mcmc_fn(waveforms, sub_params)
 
-        # flatten samples (retain full samples even if lean)
-        event_posterior = Posterior(samplers, hyper=False, lean=False)
+        # flatten samples (retain full samples)
+        event_posterior = Posterior(samplers, hyper=False)
         event_samples = np.array(event_posterior.flat_samples)
 
         # now can leanify event posteriors since we've grabbed the samples
-        if self.lean:
-            event_posterior.leanify()
+        event_posterior.leanify(self.checkpoints)
 
         # retrieve means and stds computed in Posterior object,
         # excluding amplitude
@@ -921,7 +920,10 @@ class DetectionPipeline:
         else:
             dist_samplers = self.dist_mc(event_samples)
 
-        return (event_posterior, Posterior(dist_samplers, lean=self.lean))
+        return (
+            event_posterior,
+            Posterior(dist_samplers, checkpoints=self.checkpoints)
+        )
 
     def run_hd(self, raw_waveforms, params):
         """
@@ -1013,7 +1015,7 @@ class Posterior:
     N_DISCARD = 500
     N_THIN = 50
 
-    def __init__(self, samples=None, hyper=True, lean=False, calc_autocorr=False):
+    def __init__(self, samples=None, hyper=True, checkpoints=1, calc_autocorr=False):
         """
         Create a Posterior object for storing MCMC chains and chain population
         states.
@@ -1021,8 +1023,8 @@ class Posterior:
             samples: MCMC chains
             hyper: whether these chains are for the astrophysical distribution
                 or individual events (used for plotting routines)
-            lean: whether to delete the chains and only save chain
-                statistics
+            checkpoints: how frequently to keep posteriors (=1 means keep
+                all posteriors)
             calc_autocorr: whether to calculate chain autocorrelation (will
                 throw error if insufficient chain lengths)
         """
@@ -1054,17 +1056,29 @@ class Posterior:
                 self.stds[i, :] = np.std(self.flat_samples[i], axis=0)
 
             # remove samples for leaner save files
-            self.lean = lean
-            if lean:
-                self.leanify()
+            self.checkpoints = checkpoints
+            self.leanify(checkpoints)
 
-    def leanify(self):
+    def leanify(self, checkpoints=0):
         """
-        Make the posterior footprint lean by removing all the samples.
+        Make the posterior footprint lean by removing all samples except
+        multiples of the checkpoint frequency.
+
+            checkpoints: how regularly to save the samples
         """
-        self.samples = None
-        self.flat_samples = None
-        self.lean = True
+        self.checkpoints = checkpoints
+
+        # do nothing if we need to keep all samples
+        if checkpoints == 1:
+            return
+
+        # delete all sam
+        if checkpoints == 0:
+            self.samples = []
+            self.flat_samples = []
+
+        self.samples = self.samples[checkpoints::checkpoints]
+        self.flat_samples = self.samples[checkpoints::checkpoints]
 
 def json_default(o):
     """
