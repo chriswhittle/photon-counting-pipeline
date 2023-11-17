@@ -560,11 +560,11 @@ class DetectionPipeline:
         # it is impossible (and vice versa)
         if any(counts & (avg_probs == 0)) or any((~counts) & (avg_probs == 1)):
             return -np.inf
-        # compute log likelihood for binomial distribution
-        # excludes the constant term log(num_events choose counts)
+        # compute log likelihood: 1-(no photon prob) where we saw counts
+        # and (no photon prob) where we did not
         all_probs = np.vstack((avg_probs, 1-avg_probs))
         return np.sum(
-            all_probs[counts, np.arange(all_probs.shape[1])]
+            np.log(all_probs[counts, np.arange(all_probs.shape[1])])
         )
 
     def log_likelihood_dist(self, theta, event_post, wv_ind, nint=10000):
