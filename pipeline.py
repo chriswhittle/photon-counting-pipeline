@@ -1041,6 +1041,9 @@ class Posterior:
             if len(self.flat_samples) == 0:
                 raise ValueError(f"Number of steps should be larger than N_DISCARD={self.N_DISCARD}")
 
+            # keep list of event numbers
+            self.event_numbers = np.arange(1, len(self.samples)+1)
+
             # compute autocorrelation times
             if calc_autocorr:
                 self.autocorr_times = [s.get_autocorr_time() for s in self.samples]
@@ -1077,8 +1080,9 @@ class Posterior:
             self.samples = []
             self.flat_samples = []
 
-        self.samples = self.samples[checkpoints::checkpoints]
-        self.flat_samples = self.samples[checkpoints::checkpoints]
+        self.samples = self.samples[checkpoints-1::checkpoints]
+        self.flat_samples = self.flat_samples[checkpoints-1::checkpoints]
+        self.event_numbers = self.event_numbers[checkpoints-1::checkpoints]
 
 def json_default(o):
     """
