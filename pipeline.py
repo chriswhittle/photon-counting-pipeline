@@ -48,7 +48,7 @@ class DetectionPipeline:
                  snr_cutoff=1, distance_uncertainty=0.03, distance_prior=True,
                  param_means=None, param_stds=None, mcmc_mask=None,
                  dist_priors=None, dist_gaussian=False, template_params=None,
-                 parallel=True, checkpoints=4, **kwargs):
+                 parallel=True, checkpoints=1000, **kwargs):
         """
         Initialize detection pipeline with particular frequency bins within a 
         given range and for a given interferometer noise budget.
@@ -148,6 +148,7 @@ class DetectionPipeline:
         self.param_means = np.array(param_means, dtype=np.float64)
         self.param_stds = np.array(param_stds, dtype=np.float64)
         self.mcmc_mask = mcmc_mask
+        self.event_mask = [True] + mcmc_mask # MCMC mask including distance
         self.ndim_p = np.sum(mcmc_mask)
         self.parallel = parallel
 
@@ -356,7 +357,7 @@ class DetectionPipeline:
 
         return g * Larm
 
-    def no_photon_prob(self, strain):
+    def no_photon_prob(self, strain, templates=None):
         """
         Given a series of strain spectra, convert to output optical power and then
         subsequently to "probability of observing zero photos" in each optical mode
@@ -366,15 +367,19 @@ class DetectionPipeline:
                 one of 'aLIGO', 'CE1' etc.
         Returns matrix (no. of realizations, no. of templates) of probabilities
         """
+        # default to the pipeline-specified templates
+        if templates is None:
+            templates = self.templates
+
         # output fields
         output_fields = strain * self.ifo_calibration
 
         # mean fields in output templates
         # units of sqrt(quanta) TODO: check this
         mean_counts = np.zeros(
-            (strain.shape[1], self.templates.shape[1]), dtype=complex
+            (strain.shape[1], templates.shape[1]), dtype=complex
         )
-        for i, template in enumerate(self.templates.T):
+        for i, template in enumerate(templates.T):
             mean_counts[:, i] = self.inner_product(
                 template[:, np.newaxis].repeat(strain.shape[1], axis=1),
                 output_fields
@@ -433,7 +438,7 @@ class DetectionPipeline:
         if self.distance_prior:
             distance_std = distance * self.distance_uncertainty
             distance_prior = -math.log(distance_std)
-            distance_prior -= (theta[0] - distance)/2/distance_std**2
+            distance_prior -= (theta[0] - distance)**2/2/distance_std**2
         # if we have no knowledge of the distance,
         # f(d) = 3 * (distance / max distance)^2
         else:
@@ -558,7 +563,7 @@ class DetectionPipeline:
 
         # if we saw counts where this waveform should not produce any,
         # it is impossible (and vice versa)
-        if any(counts & (avg_probs == 0)) or any((~counts) & (avg_probs == 1)):
+        if any(counts & (avg_probs == 1)) or any((~counts) & (avg_probs == 0)):
             return -np.inf
         # compute log likelihood: 1-(no photon prob) where we saw counts
         # and (no photon prob) where we did not
@@ -569,7 +574,7 @@ class DetectionPipeline:
 
     def log_likelihood_dist(self, theta, event_post, wv_ind, nint=10000):
         """
-        Log-likelihood function for hyper-parameter MCMC,
+        Log-likelihood function for astrophysical distribution MCMC,
         doing full integration based on event posteriors.
             theta: array of parameters
             wv_ind: index of current event (up to which we should sample
@@ -594,7 +599,7 @@ class DetectionPipeline:
 
     def log_likelihood_dist_gaussian(self, theta, param_means, param_stds):
         """
-        Log-likelihood function for hyper-parameter MCMC on homodyne detection,
+        Log-likelihood function for astrophysical distribution MCMC,
         assuming the event posteriors are Gaussian. Inappropriate for
         subthreshold events, which will result in uninformative (uniform)
         posteriors.
@@ -877,7 +882,7 @@ class DetectionPipeline:
         """
         Given the simulated events (without noise), add noise, process the
         waveform with detector physics then do MCMC to get the event-wise and
-        then astrophysical hyper-posteriors.
+        then astrophysical distribution posteriors.
 
             mcmc_fn: function that handles the (noisy) waveforms and produces
                 event-wise posteriors
@@ -896,21 +901,21 @@ class DetectionPipeline:
 
         # pick out true values of parameters to be inferred
         # (including amplitude)
-        sub_params = params[[True] + self.mcmc_mask, :]
+        sub_params = params[self.event_mask, :]
 
         # simulate detector physics and do MCMC to get
         # samplers
         samplers = mcmc_fn(waveforms, sub_params)
 
         # flatten samples (retain full samples)
-        event_posterior = Posterior(samplers, hyper=False)
+        event_posterior = Posterior(samplers, dist=False)
         event_samples = np.array(event_posterior.flat_samples)
 
         # now can leanify event posteriors since we've grabbed the samples
         event_posterior.leanify(self.checkpoints)
 
         # retrieve means and stds computed in Posterior object,
-        # excluding amplitude
+        # excluding distance
         means = event_posterior.means[:,1:]
         stds = event_posterior.means[:,1:]
 
@@ -984,7 +989,7 @@ class DetectionPipeline:
         # draw event parameters and simulate waveforms
         params, waveforms = self.sample_events(n, True)
 
-        # sort events by distance and perform hyper-MCMC on sorted events
+        # sort events by distance and perform distribution MCMC on sorted events
         distances = params[0,:]
         if snr_sorted:
             sorted_inds = np.argsort(distances)
@@ -1000,7 +1005,7 @@ class DetectionPipeline:
         pc_results = self.run_pc(waveforms, params)
 
         # return computed data
-        return PipelineResults(self, distances, *hd_results, *pc_results)
+        return PipelineResults(self, params, *hd_results, *pc_results)
 
 
 class Posterior:
@@ -1015,13 +1020,13 @@ class Posterior:
     N_DISCARD = 500
     N_THIN = 50
 
-    def __init__(self, samples=None, hyper=True, checkpoints=1, calc_autocorr=False):
+    def __init__(self, samples=None, dist=True, checkpoints=1, calc_autocorr=False):
         """
         Create a Posterior object for storing MCMC chains and chain population
         states.
 
             samples: MCMC chains
-            hyper: whether these chains are for the astrophysical distribution
+            dist: whether these chains are for the astrophysical distribution
                 or individual events (used for plotting routines)
             checkpoints: how frequently to keep posteriors (=1 means keep
                 all posteriors)
@@ -1029,8 +1034,9 @@ class Posterior:
                 throw error if insufficient chain lengths)
         """
         if samples is not None:
-            # whether this posterior is for the astrophysical hyper-parameters
-            self.hyper = hyper
+            # whether this posterior is for the astrophysical distribution
+            # parameters
+            self.dist = dist
 
             # flatten chain samples
             self.samples = list(samples)
@@ -1116,17 +1122,17 @@ class PipelineResults:
     """
     pipeline: DetectionPipeline
 
-    # list of event distances
-    event_distances: np.ndarray
+    # list of event parameters (0: distance, 1: amplitde, 2+: waveform args)
+    event_params: np.ndarray
 
     # individual event inferences from homodyne detection
     hd_event_posterior: Posterior
 
-    # individual event inferences from homodyne detection
-    pc_event_posterior: Posterior
-
     # distribution posterior from homodyne detection
     hd_posterior: Posterior
+
+    # individual event inferences from homodyne detection
+    pc_event_posterior: Posterior
 
     # distribution posterior from photon counting
     pc_posterior: Posterior
