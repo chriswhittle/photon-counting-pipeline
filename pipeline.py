@@ -153,12 +153,12 @@ class DetectionPipeline:
         if param_stds is None:
             param_stds = [0]*param_count
         if mcmc_mask is None:
-            mcmc_mask = [True]*param_count
+            mcmc_mask = [True]*(param_count + 1)
 
         self.param_means = np.array(param_means, dtype=np.float64)
         self.param_stds = np.array(param_stds, dtype=np.float64)
-        self.mcmc_mask = mcmc_mask
-        self.event_mask = [True] + mcmc_mask # MCMC mask including distance
+        self.mcmc_mask = list(mcmc_mask)
+        self.event_mask = [True] + self.mcmc_mask # MCMC mask including distance
         self.ndim_p = np.sum(mcmc_mask)
         self.parallel = parallel
 
@@ -432,14 +432,6 @@ class DetectionPipeline:
     # number of noise realizations to use when integrating probability
     # of detecting a photon given waveform parameters
     DEFAULT_PHOTON_INT = 500
-
-    DEFAULT_STEPS_EVENT = 200  # TODO:
-    DEFAULT_STEPS_DIST = 30  # TODO:
-    DEFAULT_PHOTON_INT = 100 # TODO:
-
-    # DEFAULT_STEPS_EVENT = 400  # TODO:
-    # DEFAULT_STEPS_DIST = 400  # TODO:
-    # DEFAULT_PHOTON_INT = 100 # TODO:
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -1056,11 +1048,6 @@ class Posterior:
     # https://emcee.readthedocs.io/en/stable/tutorials/line/
     N_DISCARD = 500
     N_THIN = 50
-    N_DISCARD = 20#TODO:
-    N_THIN = 4#TODO:
-    
-    # N_DISCARD = 150#TODO:
-    # N_THIN = 10#TODO:
 
     def __init__(self, samples=None, dist=True, checkpoints=1, calc_autocorr=False):
         """
@@ -1157,6 +1144,17 @@ def json_default(o):
     # do not save if cannot be serialized
     return None
 
+def dict_members_to_numpy(d):
+    """
+    Convert all top-level list values in a dictionary to numpy arrays.
+
+        d: dictionary to convert
+    """
+    for key, value in d.items():
+        if isinstance(value, list):
+            d[key] = np.array(value)
+    return d
+
 @dataclass
 class PipelineResults:
     """
@@ -1225,6 +1223,8 @@ class PipelineResults:
         with open(filename, 'r') as f:
             results = json.load(f)
 
+        dict_members_to_numpy(results)
+
         # build objects from dictionaries loaded via JSON
         for m in getmembers(PipelineResults):
             if m[0] == '__dataclass_fields__':
@@ -1233,6 +1233,7 @@ class PipelineResults:
 
                     # set values in posterior objects
                     if attr_class == Posterior:
+                        dict_members_to_numpy(results[attr_name])
                         new_posterior = Posterior()
                         for key, value in results[attr_name].items():
                             setattr(new_posterior, key, value)
@@ -1240,10 +1241,11 @@ class PipelineResults:
 
                     # set values in pipeline object
                     if attr_class == DetectionPipeline:
+                        dict_members_to_numpy(results[attr_name])
                         results[attr_name] = DetectionPipeline(
                             **results[attr_name]
                         )
-        
+
         return PipelineResults(**results)
 
 
