@@ -184,6 +184,7 @@ class DetectionPipeline:
 
         # compute template waveforms given matrix of parameter values
         if template_params is not None:
+            self.template_params = template_params
             self.templates = self.waveform(np.array(template_params).T)
 
             # orthonormalize waveform templates
@@ -431,6 +432,14 @@ class DetectionPipeline:
     # number of noise realizations to use when integrating probability
     # of detecting a photon given waveform parameters
     DEFAULT_PHOTON_INT = 500
+
+    DEFAULT_STEPS_EVENT = 200  # TODO:
+    DEFAULT_STEPS_DIST = 30  # TODO:
+    DEFAULT_PHOTON_INT = 100 # TODO:
+
+    # DEFAULT_STEPS_EVENT = 400  # TODO:
+    # DEFAULT_STEPS_DIST = 400  # TODO:
+    # DEFAULT_PHOTON_INT = 100 # TODO:
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -1047,6 +1056,11 @@ class Posterior:
     # https://emcee.readthedocs.io/en/stable/tutorials/line/
     N_DISCARD = 500
     N_THIN = 50
+    N_DISCARD = 20#TODO:
+    N_THIN = 4#TODO:
+    
+    # N_DISCARD = 150#TODO:
+    # N_THIN = 10#TODO:
 
     def __init__(self, samples=None, dist=True, checkpoints=1, calc_autocorr=False):
         """
