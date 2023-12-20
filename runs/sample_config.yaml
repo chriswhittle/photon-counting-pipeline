@@ -3,9 +3,10 @@ event_count: 20
 parallel: True
 
 output_file: results.json
-lean: True
+checkpoints: 100
 
 snr_sorted: False
+snr_cutoff: 5
 
 # detector (gwinc label)
 detector: CE1

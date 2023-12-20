@@ -46,6 +46,7 @@ class DetectionPipeline:
     def __init__(self, f_sample=16384, bin_width=1, f_low=None, f_high=None,
                  detector='CE1', waveform_func=waveform.lorentzian,
                  snr_cutoff=1, distance_uncertainty=0.03, distance_prior=True,
+                 approx_probs=True, N_approx_probs=100000,
                  param_means=None, param_stds=None, mcmc_mask=None,
                  dist_priors=None, dist_gaussian=False, template_params=None,
                  parallel=True, checkpoints=1000, **kwargs):
@@ -73,6 +74,15 @@ class DetectionPipeline:
             distance_prior: whether to use the true distance as a prior
                 for inference on a post-merger event (e.g. having inferred
                 it from the coalescence)
+            approx_probs: whether to approximate photon probabilities as the
+                sum of the probabilities of observing zero photons with only
+                signal and only noise (as a proxy for the probabilities
+                given a signal in the presence of noise) plus a linear
+                correction (very accurate for probability of no photon ~1);
+                if False, the full probability is computed using numerical
+                integration
+            N_approx_probs: number of noise realizations to use when computing
+                probabilities in the presence of noise alone
             param_means: list of means for waveform parameters; length should be
                 equal to 1 + number of arguments of waveform_func (first is
                 reserved for an amplitude parameter)
@@ -178,6 +188,16 @@ class DetectionPipeline:
 
             # orthonormalize waveform templates
             self.templates = orth(self.templates)
+
+        # whether to approximate photon probabilities as the sum of
+        # probabilities with just noise and just signal
+        self.approx_probs = approx_probs
+        if self.approx_probs:
+            noise_realizations = self.simulate_noise(
+                N_approx_probs, self.noise_classical
+            )
+            int_probs = self.no_photon_prob(noise_realizations)
+            self.noise_probs = np.mean(int_probs, axis=0)
 
         # precompute some other useful matrices
         self._event_prior_sign_mat = (
@@ -410,7 +430,7 @@ class DetectionPipeline:
 
     # number of noise realizations to use when integrating probability
     # of detecting a photon given waveform parameters
-    DEFAULT_PHOTON_INT = 10000
+    DEFAULT_PHOTON_INT = 500
 
     # constants for setting up walker initial positions
     WALKER_STD = 3e-1
@@ -551,15 +571,23 @@ class DetectionPipeline:
         model = self._compute_walker_waveform(theta)
 
         # for these waveform parameters, compute the probability
-        # of observing zero photons in each template mode by sampling
-        # noise realizations and computing the average probability
-        int_wv = (
-            model[:,np.newaxis].repeat(self.DEFAULT_PHOTON_INT, axis=1) +
-            self.simulate_noise(
-                self.DEFAULT_PHOTON_INT, self.noise_classical
-        ))
-        int_probs = self.no_photon_prob(int_wv)
-        avg_probs = np.mean(int_probs, axis=0)
+        # of observing zero photons in each template mode by either:
+        # 1) approximating
+        # P(no photon | signal+noise)
+        # ~= P(no photon | signal)*P(no photon | noise)
+        if self.approx_probs:
+            waveform_probs = self.no_photon_prob(model[:,np.newaxis])[0,:]
+            avg_probs = waveform_probs * self.noise_probs
+        # or 2) by sampling noise realizations and computing the average
+        # probability numerically
+        else:
+            int_wv = (
+                model[:,np.newaxis].repeat(self.DEFAULT_PHOTON_INT, axis=1) +
+                self.simulate_noise(
+                    self.DEFAULT_PHOTON_INT, self.noise_classical
+            ))
+            int_probs = self.no_photon_prob(int_wv)
+            avg_probs = np.mean(int_probs, axis=0)
 
         # if we saw counts where this waveform should not produce any,
         # it is impossible (and vice versa)
