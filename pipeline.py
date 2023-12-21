@@ -1115,9 +1115,9 @@ class Posterior:
             self.samples = []
             self.flat_samples = []
 
-        self.samples = self.samples[checkpoints-1::checkpoints]
-        self.flat_samples = self.flat_samples[checkpoints-1::checkpoints]
-        self.event_numbers = self.event_numbers[checkpoints-1::checkpoints]
+        self.samples = self.samples[::checkpoints]
+        self.flat_samples = self.flat_samples[::checkpoints]
+        self.event_numbers = self.event_numbers[::checkpoints]
 
 def json_default(o):
     """
